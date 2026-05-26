@@ -7,8 +7,8 @@ from fruit_tree import FruitTreeEnv
 from two_lake import TwoLakeEnv
 from constrained_two_lake import ConstrainedTwoLakeEnv
 from morl.pql import PQL
-from params_config import slip_patterns_path, nd_size_cap_tree, \
-    lake_scenarios_path, nd_size_cap_lake, nd_update_freq_tree, nd_update_freq_lake, \
+from params_config import slip_patterns_path, lake_scenarios_path, \
+    nd_size_cap_lake, nd_update_freq_tree, nd_update_freq_lake, \
     archive_cap_tree, archive_cap_lake, total_years, years_per_action, \
     gamma_tree, gamma_lake, tree_n_scenarios, lake_n_scenarios
 
@@ -121,7 +121,7 @@ def run_moro(
         nd_update_freq=nd_update_freq_tree,
         robust=True,
         n_scenarios=tree_n_scenarios,
-        max_nd_size=nd_size_cap_tree,
+        max_nd_size=None,
         max_archive_size=archive_cap_tree,
         verbose=True,
         tag=file_end,

@@ -35,6 +35,30 @@ def get_non_dominated(candidates):
     return {tuple(arr[i]) for i in range(arr.shape[0]) if mask[i]}
 
 
+def _additive_epsilon(A: np.ndarray, B: np.ndarray) -> float:
+    """I_eps+(A, B) under MAXIMISATION: smallest eps s.t. every b in B is
+    eps-dominated by some a in A. 0 if B empty; inf if A empty & B non-empty.
+
+    Can be negative when every b is strictly dominated by some a (the later
+    front shrank inside the earlier one) — this is intentional and lets the
+    symmetric metric pass through zero rather than flooring at convergence.
+    """
+    if B.shape[0] == 0:
+        return 0.0
+    if A.shape[0] == 0:
+        return np.inf
+    diff = B[:, None, :] - A[None, :, :]      # b_i - a_i
+    return float(diff.max(axis=2).min(axis=1).max())
+
+
+def pcs_shift(prev: set, curr: set, d: int) -> float:
+    """Symmetric additive epsilon-indicator between two Pareto sets.
+    """
+    A = np.array(list(prev), float) if prev else np.empty((0, d))
+    B = np.array(list(curr), float) if curr else np.empty((0, d))
+    return max(_additive_epsilon(A, B), _additive_epsilon(B, A))
+
+
 def generate_weights(num_objectives: int, num_divisions: int) -> np.ndarray:
     """Generate evenly spaced weight vectors on the unit simplex."""
     combs = product(range(num_divisions + 1), repeat=num_objectives)
@@ -164,8 +188,10 @@ class PQL(MOAgent):
             for a in range(self.num_actions):
                 if self.counts[s][a] == 0:
                     continue
-                for vec in self.get_q_set(s, a, decomp=decomp):
-                    self.ideal_point = np.maximum(self.ideal_point, np.array(vec))
+                qa = self.get_q_array(s, a, decomp=decomp)
+                if qa.shape[0]:
+                    self.ideal_point = np.maximum(self.ideal_point,
+                                                  qa.max(axis=0))
 
     # ------------------------------------------------------------------
     # Scoring functions
@@ -196,7 +222,7 @@ class PQL(MOAgent):
         scores = np.zeros(self.num_actions)
         for a in range(self.num_actions):
             scores[a] = hypervolume(self.ref_point,
-                                    list(self.get_q_set(state, a)))
+                                    self.get_q_array(state, a))
         return scores
 
     def score_decomposition(self, state: int):
@@ -258,36 +284,46 @@ class PQL(MOAgent):
             )
 
     def _subsample_nd(self, nd: set, target_size: int = None) -> set:
-        """Subsample a non-dominated set down to target_size via crowding distance."""
+        """Subsample a non-dominated set to target_size via crowding
+        distance.
+        """
         if target_size is None:
             target_size = self.max_nd_size
         if target_size is None or len(nd) <= target_size:
             return nd
         arr = np.array(list(nd))
         n, d = arr.shape
+        # Canonical row order: depends only on the set contents.
+        canon = np.lexsort(tuple(arr[:, c] for c in range(d - 1, -1, -1)))
+        arr = arr[canon]
         crowd = np.zeros(n)
         for obj in range(d):
-            order = np.argsort(arr[:, obj])
+            order = np.argsort(arr[:, obj], kind='stable')
             crowd[order[0]] = crowd[order[-1]] = np.inf
             obj_range = arr[order[-1], obj] - arr[order[0], obj]
             if obj_range == 0:
                 continue
-            for i in range(1, n - 1):
-                crowd[order[i]] += (
-                        (arr[order[i + 1], obj] - arr[order[i - 1], obj]) / obj_range
-                )
-        keep = np.argsort(crowd)[-target_size:]
+            s = arr[order, obj]
+            crowd[order[1:-1]] += (s[2:] - s[:-2]) / obj_range
+        # Keep largest crowding; ties broken by canonical coordinates.
+        keys = tuple(arr[:, c] for c in range(d - 1, -1, -1)) + (crowd,)
+        keep = np.lexsort(keys)[-target_size:]
         return {tuple(arr[i]) for i in keep}
 
     def calc_non_dominated(self, state: int):
-        candidates = set().union(*[
-            self.get_q_set(state, a) for a in range(self.num_actions)
-        ])
-        if not candidates:
+        # Stack per-action Q-arrays and prune directly.
+        parts = []
+        for a in range(self.num_actions):
+            qa = self.get_q_array(state, a)
+            if qa.shape[0]:
+                parts.append(qa)
+        if not parts:
             return {tuple(np.zeros(self.num_objectives))}
-        if len(candidates) == 1:
-            return candidates
-        nd = get_non_dominated(candidates)
+        Q = np.vstack(parts)
+        if Q.shape[0] == 1:
+            return {tuple(Q[0])}
+        mask = _nd_mask(Q)
+        nd = {tuple(Q[i]) for i in range(Q.shape[0]) if mask[i]}
         if self.max_nd_size is not None:
             return self._subsample_nd(nd)
         return nd
@@ -303,8 +339,14 @@ class PQL(MOAgent):
 
         Q = np.array(q_vecs, dtype=float)
         dev = self.ideal_point - Q
-        scalarised = np.max(self.weights[:, None, :] * dev[None, :, :], axis=2)
-        best_idx = np.argmin(scalarised, axis=1)
+        # scalarised[w, p] = max_o ( weights[w, o] * dev[p, o] )
+        # Running max over the d objectives avoids materialising the full
+        # (n_weights, P, d) product.
+        scal = np.full((self.weights.shape[0], Q.shape[0]), -np.inf)
+        for o in range(self.weights.shape[1]):
+            np.maximum(scal, np.outer(self.weights[:, o], dev[:, o]),
+                       out=scal)
+        best_idx = np.argmin(scal, axis=1)
         global_set = {tuple(Q[i]) for i in best_idx}
         return global_set if global_set else {tuple(np.zeros(self.num_objectives))}
 
@@ -341,6 +383,7 @@ class PQL(MOAgent):
 
         convergence_log = []
         next_log_step = log_every
+        prev_pcs = None
 
         while self.global_step < total_timesteps:
             state, _ = self.env.reset()
@@ -405,18 +448,22 @@ class PQL(MOAgent):
                 if self.global_step >= next_log_step:
                     pcs = self.get_local_pcs(state=self._start_state, decomp=is_decomp)
 
-                    # hv = hypervolume(self.ref_point, list(pcs)) if pcs else 0.0
+                    shift = (None if prev_pcs is None
+                             else pcs_shift(prev_pcs, pcs, self.num_objectives))
+                    prev_pcs = set(pcs)
+
                     convergence_log.append({
                         "timestep": self.global_step,
-                        # "hypervolume": hv,
                         "pcs_size": len(pcs),
+                        "pcs_shift_eps": shift,
                         "epsilon": self.epsilon,
                     })
                     if self.verbose:
                         prefix = f'[{self.tag}] ' if self.tag else '  '
+                        s = '—' if shift is None else f'{shift:.4g}'
                         print(
                             f'{prefix}step {self.global_step}/{total_timesteps} '
-                            f'|archive|={len(pcs)} '
+                            f'|archive|={len(pcs)} Δpcs={s} '
                             f'eps={self.epsilon:.3f}',
                             flush=True,
                         )

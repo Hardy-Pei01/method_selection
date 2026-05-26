@@ -2,7 +2,7 @@ import numpy as np
 import gymnasium as gym
 from scipy.optimize import brentq
 
-LAKE_BINS = np.array([0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 1.0, 3.0, 12.0])
+LAKE_BINS = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.55, 0.75, 0.90, 1.5, 5.0])
 REDUCED_EMISSIONS = np.array([0.00, 0.02, 0.04, 0.06, 0.08, 0.10])
 
 
@@ -12,10 +12,10 @@ class TwoLakeEnv(gym.Env):
             self,
             # Lake 1 parameters
             b1=0.42,
-            q1=2.0,
+            q1=2.5,
             # Lake 2 parameters — deliberately different to ensure objective independence
             b2=0.35,
-            q2=2.5,
+            q2=3.0,
             # Shared inflow parameters
             mean=0.02,
             stdev=0.0017,
@@ -146,20 +146,20 @@ class TwoLakeEnv(gym.Env):
 
         utility1 = float(np.sum(self.alpha * u1 * discount))
         utility2 = float(np.sum(self.alpha * u2 * discount))
-        reliability1 = (float(np.mean(X1_traj < self.Pcrit1)) * self.years_per_action / self.total_years)
-        reliability2 = (float(np.mean(X2_traj < self.Pcrit2)) * self.years_per_action / self.total_years)
+        # Per-step safety contribution: -max(X) over this step's 5-year window,
+        # scaled by years_per_action / total_years.
+        max_P1_step = float(np.max(X1_traj)) * self.years_per_action / self.total_years
+        max_P2_step = float(np.max(X2_traj)) * self.years_per_action / self.total_years
         inertia1 = (float(not np.isnan(self.prev_u1) and abs(u1 - self.prev_u1) > 0.02)
                     * self.years_per_action / self.total_years)
         inertia2 = (float(not np.isnan(self.prev_u2) and abs(u2 - self.prev_u2) > 0.02)
                     * self.years_per_action / self.total_years)
 
-        # Reward vector — sign convention: positive = better for the agent
-        # RL maximises rewards, so minimisation objectives are negated
         rewards = np.array([
+            -max_P1_step,
+            -max_P2_step,
             utility1,
             utility2,
-            reliability1,
-            reliability2,
             -inertia1,
             -inertia2,
         ], dtype=np.float32)
@@ -172,7 +172,7 @@ class TwoLakeEnv(gym.Env):
         terminated = self.gym_step >= self.n_gym_steps
 
         if self.num_obj == 2:
-            rewards = rewards[[0, 2]]  # utility1, reliability1
+            rewards = rewards[[0, 2]]  # (-max_P1_step, utility1)
 
         return self._obs(), rewards, terminated, False, {}
 

@@ -2,16 +2,10 @@ import numpy as np
 import gymnasium as gym
 from scipy.optimize import brentq
 
-LAKE_BINS = np.array([0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 1.0, 3.0, 12.0])
+LAKE_BINS = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.55, 0.75, 0.90, 1.5, 5.0])
 REDUCED_EMISSIONS = np.array([0.00, 0.02, 0.04, 0.06, 0.08, 0.10])
 
-# Hard-constraint threshold on max_P. Mirrors Bartholomew & Kwakkel (2020):
-# any year where X_lake > MAX_P_THRESHOLD is a constraint violation; a
-# policy is infeasible if it has any violation in any scenario.
-MAX_P_THRESHOLD = 2.5
-
-# Per-violating-year, per-axis penalty. Sustained — every year above the
-# threshold incurs the penalty, applied uniformly to every reward dimension.
+# Per-violating-year, per-axis penalty.
 VIOLATION_PENALTY = 10.0
 
 
@@ -22,10 +16,10 @@ class ConstrainedTwoLakeEnv(gym.Env):
             self,
             # Lake 1 parameters
             b1=0.42,
-            q1=2.0,
+            q1=2.5,
             # Lake 2 parameters — deliberately different to ensure objective independence
             b2=0.35,
-            q2=2.5,
+            q2=3.0,
             # Shared inflow parameters
             mean=0.02,
             stdev=0.0017,
@@ -118,10 +112,6 @@ class ConstrainedTwoLakeEnv(gym.Env):
         # since there's no preceding action to compare against.
         self.prev_u1 = np.nan
         self.prev_u2 = np.nan
-        # --- Constraint tracking (not part of observation) ---
-        self._running_max_X1 = 0.0
-        self._running_max_X2 = 0.0
-        # Cumulative count of violating years (X > MAX_P_THRESHOLD).
         self._n_violations_1 = 0
         self._n_violations_2 = 0
 
@@ -136,8 +126,6 @@ class ConstrainedTwoLakeEnv(gym.Env):
         self.gym_step = 0
         self.prev_u1 = np.nan
         self.prev_u2 = np.nan
-        self._running_max_X1 = 0.0
-        self._running_max_X2 = 0.0
         self._n_violations_1 = 0
         self._n_violations_2 = 0
         return self._obs(), {}
@@ -153,7 +141,7 @@ class ConstrainedTwoLakeEnv(gym.Env):
         self.X1 = float(X1_new)
         self.X2 = float(X2_new)
 
-        # --- Compute 6 objectives (identical to TwoLakeEnv) ---
+        # --- Compute 6 objectives ---
         # Absolute year indices for discounting
         year_start = self.gym_step * self.years_per_action
         years = np.arange(year_start, year_start + self.years_per_action)
@@ -161,45 +149,30 @@ class ConstrainedTwoLakeEnv(gym.Env):
 
         utility1 = float(np.sum(self.alpha * u1 * discount))
         utility2 = float(np.sum(self.alpha * u2 * discount))
-        reliability1 = (float(np.mean(X1_traj < self.Pcrit1))
-                        * self.years_per_action / self.total_years)
-        reliability2 = (float(np.mean(X2_traj < self.Pcrit2))
-                        * self.years_per_action / self.total_years)
+        # Per-step safety contribution: -max(X) over this step's 5-year window,
+        # scaled by years_per_action / total_years.
+        max_P1_step = float(np.max(X1_traj)) * self.years_per_action / self.total_years
+        max_P2_step = float(np.max(X2_traj)) * self.years_per_action / self.total_years
         inertia1 = (float(not np.isnan(self.prev_u1) and abs(u1 - self.prev_u1) > 0.02)
                     * self.years_per_action / self.total_years)
         inertia2 = (float(not np.isnan(self.prev_u2) and abs(u2 - self.prev_u2) > 0.02)
                     * self.years_per_action / self.total_years)
 
-        # --- Constraint tracking ---
-        # Update running max for the info dict and feasibility checks.
-        step_max1 = float(np.max(X1_traj))
-        step_max2 = float(np.max(X2_traj))
-        self._running_max_X1 = max(self._running_max_X1, step_max1)
-        self._running_max_X2 = max(self._running_max_X2, step_max2)
-
-        # Count years in this step's trajectory exceeding the threshold.
-        n_violating_1 = int(np.sum(X1_traj > MAX_P_THRESHOLD))
-        n_violating_2 = int(np.sum(X2_traj > MAX_P_THRESHOLD))
+        n_violating_1 = int(np.sum(X1_traj > self.Pcrit1))
+        n_violating_2 = int(np.sum(X2_traj > self.Pcrit2))
         self._n_violations_1 += n_violating_1
         self._n_violations_2 += n_violating_2
-
-        # --- Hard-constraint penalty (applied uniformly to all axes) ---
         if self.num_obj == 2:
-            # 2-obj mode: lake 2 violations are not counted (lake 2 is
-            # invisible to the agent in this configuration).
+            # 2-obj mode: only lake-1 violations count (lake 2 invisible).
             penalty = -VIOLATION_PENALTY * n_violating_1
         else:
-            # 6-obj mode: any violation in either lake invalidates the
-            # policy; penalty applied uniformly across all dimensions.
             penalty = -VIOLATION_PENALTY * (n_violating_1 + n_violating_2)
 
-        # --- Assemble reward vector (penalty added to every axis) ---
-        # Sign convention: positive = better for the agent.
         rewards = np.array([
+            -max_P1_step + penalty,
+            -max_P2_step + penalty,
             utility1 + penalty,
             utility2 + penalty,
-            reliability1 + penalty,
-            reliability2 + penalty,
             -inertia1 + penalty,
             -inertia2 + penalty,
         ], dtype=np.float32)
@@ -212,15 +185,13 @@ class ConstrainedTwoLakeEnv(gym.Env):
 
         # --- 2-obj projection (lake 1 only) ---
         if self.num_obj == 2:
-            rewards = rewards[[0, 2]]  # (utility1, reliability1)
+            rewards = rewards[[0, 2]]  # (-max_P1_step, utility1)
 
         info = {
-            'n_violations_1': self._n_violations_1,
-            'n_violations_2': self._n_violations_2,
             'feasible': (self._n_violations_1 == 0
                          and (self.num_obj == 2 or self._n_violations_2 == 0)),
-            'running_max_X1': self._running_max_X1,
-            'running_max_X2': self._running_max_X2,
+            'n_violations_1': self._n_violations_1,
+            'n_violations_2': self._n_violations_2,
         }
         return self._obs(), rewards, terminated, False, info
 

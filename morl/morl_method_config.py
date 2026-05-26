@@ -79,14 +79,14 @@ class moro_lake_morl_params(base_lake_morl_params):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def output_file_end(params):
-    return f'{params.name}_{params.timesteps}'
+    return f'{params.timesteps}'
 
 
 def _build_lake_env(ref, n_obj):
     """Construct a TwoLakeEnv from a reference scenario dict."""
     return TwoLakeEnv(
-        b1=ref.get('b1', 0.42), q1=ref.get('q1', 2.0),
-        b2=ref.get('b2', 0.35), q2=ref.get('q2', 2.5),
+        b1=ref.get('b1', 0.42), q1=ref.get('q1', 2.5),
+        b2=ref.get('b2', 0.35), q2=ref.get('q2', 3.0),
         inflow_seed1=ref.get('inflow_seed1', 0),
         inflow_seed2=ref.get('inflow_seed2', 0),
         Pcrit1=ref.get('Pcrit1', None),
@@ -229,8 +229,8 @@ def _build_constrained_lake_env(ref, n_obj):
     """Constrained-env constructor with the same per-ref signature as
     _build_lake_env, used by constrained_morl_multi_lake."""
     return ConstrainedTwoLakeEnv(
-        b1=ref.get('b1', 0.42), q1=ref.get('q1', 2.0),
-        b2=ref.get('b2', 0.35), q2=ref.get('q2', 2.5),
+        b1=ref.get('b1', 0.42), q1=ref.get('q1', 2.5),
+        b2=ref.get('b2', 0.35), q2=ref.get('q2', 3.0),
         inflow_seed1=ref.get('inflow_seed1', 0),
         inflow_seed2=ref.get('inflow_seed2', 0),
         Pcrit1=ref.get('Pcrit1', None),

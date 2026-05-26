@@ -1,254 +1,227 @@
-"""Re-evaluate robust MOEA tree policies (multi and moro) on a held-out
-evaluation scenario set.
-
-Re-evaluation runs per seed folder:
-  1. Collect archive files in the seed folder. multi has 5 ref-scenario
-     files (ref_num 0..4); moro has 1. Skip *_pruned.csv and *_evaluated.csv.
-  2. Merge rows from all files; for multi, dedup by decision-variable
-     fingerprint so a policy trained on different reference scenarios is
-     evaluated only once.
-  3. Re-evaluate every distinct policy under all evaluation scenarios:
-     mean of each objective across scenarios.
-  4. Drop dominated rows (Pareto filter, minimization form).
-  5. Write `archives_{stem}_{nfe}_evaluated.csv` into the same seed folder.
-
-Output columns: policy_id, the decision columns, o1_mean..on_mean. The
-reference_scenario field from multi archives is dropped (irrelevant after
-merging). Objectives are in MIN-form (negated rewards) to match the
-training-archive sign convention.
-
-MOEA policies are read directly:
-  - intertemporal: levers l0..l{depth-1} = fixed action sequence.
-  - table:         levers n0..n{2^depth-2} = state-indexed action table.
-
-Usage:
-    python evaluate_tree_moea_robust.py
-"""
-import os
-import re
-import time
-
+import os, re, glob, json, time
 import numpy as np
 import pandas as pd
+from collections import defaultdict
+from moocore import hypervolume as _exact_hv
 
-from fruit_tree import FruitTreeEnv
+# ----------------------------------------------------------------------
+# Experiment selection — flip 1/0
+# ----------------------------------------------------------------------
+INPUT_ROOT = '../data/tree_data_1/'
+OUTPUT_ROOT = '../data/tree_data_1'
+SETTING = 'deterministic'
 
-try:
-    from moocore import is_nondominated as _moocore_is_nd
-except ImportError:
-    _moocore_is_nd = None
-
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-MOEA_BASE = '../tree_data/robust/moea'
-EVAL_PATTERNS_PATH = '../trees/slip_patterns_depth9_eval.npy'
-CSV_PATH_DIM = {
-    2: '../trees/depth9_dim2.csv',
-    6: '../trees/depth9_dim6.csv',
+run_moea_method = {
+    'NSGAII': 1,
+    'IBEA': 1,
+    'MOEAD': 1,
 }
-TREE_DEPTH = 9
+run_policy = {
+    'table': 1,
+    'intertemporal': 1,
+}
+run_observability = {
+    'observable': 1,
+    'non_observable': 1,
+}
+run_n_obj = {2: 1, 6: 1}
 
-# Cell folder → (policy_kind, algo, method, n_obj, obs). Only multi/moro robust.
-FOLDER_RE = re.compile(
-    r'^(intertemporal|table)_(NSGAII|IBEA|MOEAD)_(multi|moro)_(\d+)_'
-    r'(observable|non_observable)$'
-)
-# Archive files: archives_{stem}_{nfe}[_{ref_num}].csv
-ARCHIVE_RE = re.compile(r'^archives_(.+?)_(\d+)(?:_(\d+))?\.csv$')
-
-
-# ── Policy rollout ────────────────────────────────────────────────────────────
-def rollout_intertemporal(env, decisions):
-    """Apply a fixed action sequence under the env's current slip pattern.
-    Returns the per-objective sum, NEGATED (minimization convention).
-    """
-    env.reset()
-    total = np.zeros(env.reward_dim)
-    for action in decisions:
-        _, reward, terminal, _, _ = env.step(int(action))
-        total += reward
-        if terminal:
-            break
-    return -total
+MC_SAMPLES_6OBJ = 50_000
+MC_SEED = 12345
 
 
-def rollout_table(env, table, depth):
-    """Apply a state-indexed table policy under the env's current slip
-    pattern: at each step look up the action by node_id = 2^level - 1 + pos.
-    Returns the per-objective sum, NEGATED (minimization convention).
-    """
-    obs, _ = env.reset()
-    total = np.zeros(env.reward_dim)
-    for _ in range(depth):
-        level, pos = obs
-        node_id = int(2 ** level - 1) + pos
-        action = int(table[node_id])
-        obs, reward, terminal, _, _ = env.step(action)
-        total += reward
-        if terminal:
-            break
-    return -total
+# ----------------------------------------------------------------------
+# Front loading
+# ----------------------------------------------------------------------
+def _obj_cols(df):
+    return [c for c in df.columns if re.match(r'^o\d+$', c)]
 
 
-# ── Pareto filter (minimization form) ─────────────────────────────────────────
-def _filter_non_dominated(values):
-    """Boolean mask of non-dominated rows. Inputs are minimization
-    objectives (smaller is better — matches the negative-reward convention).
-    """
-    arr = np.asarray(values, dtype=float)
-    if arr.shape[0] <= 1:
-        return np.ones(arr.shape[0], dtype=bool)
-    if _moocore_is_nd is not None:
-        return _moocore_is_nd(arr)
-    # Fallback O(n^2) — fine for archive-sized inputs.
-    n = arr.shape[0]
-    keep = np.ones(n, dtype=bool)
-    for i in range(n):
-        if not keep[i]:
+def _front_maxconv(path):
+    """MOEA archives are MIN-conv -> negate to MAX-conv."""
+    df = pd.read_csv(path)
+    v = df[_obj_cols(df)].values.astype(float)
+    return -v
+
+
+def _seed_dirs(base, stem):
+    root = os.path.join(base, stem)
+    if not os.path.isdir(root):
+        return []
+    return sorted(d for d in glob.glob(os.path.join(root, 'seed*'))
+                  if os.path.isdir(d))
+
+
+def _only_csv(folder, prefix):
+    hits = [f for f in os.listdir(folder)
+            if f.startswith(prefix) and f.endswith('.csv')]
+    return os.path.join(folder, hits[0]) if hits else None
+
+
+def _enabled_cells():
+    """Yield (paradigm, method, condition, n_obj, seed_idx, front_maxconv)
+    for every enabled+available MOEA run. Deterministic MOEA archives
+    are single-scenario realised returns, so no re-evaluation is needed
+    here — we read archives_*.csv directly."""
+
+    moea_base = os.path.join(INPUT_ROOT, SETTING, 'moea')
+    for n_obj, on in run_n_obj.items():
+        if not on:
             continue
-        for j in range(n):
-            if i == j or not keep[j]:
+        for method, m_on in run_moea_method.items():
+            if not m_on:
                 continue
-            if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
-                keep[i] = False
-                break
-    return keep
+            for policy, p_on in run_policy.items():
+                if not p_on:
+                    continue
+                for obs, o_on in run_observability.items():
+                    if not o_on:
+                        continue
+                    stem = f'{policy}_{method}_single_{n_obj}_{obs}'
+                    sds = _seed_dirs(moea_base, stem)
+                    if not sds:
+                        continue
+                    cond = f'{policy}_{obs}'
+                    for sd in sds:
+                        csv = _only_csv(sd, 'archives_')
+                        if csv:
+                            k = int(re.search(r'seed(\d+)', sd).group(1))
+                            yield ('MOEA', method, cond, n_obj, k,
+                                   _front_maxconv(csv))
 
 
-# ── Per-seed evaluation ───────────────────────────────────────────────────────
-def evaluate_seed_folder(seed_dir, policy_kind, n_obj, depth, csv_path,
-                         eval_patterns):
-    """Evaluate all policies in one seed folder.
+# ----------------------------------------------------------------------
+# Hypervolume (MAX convention)
+# ----------------------------------------------------------------------
+def _hv_exact(front_max, ref_min):
+    if len(front_max) == 0:
+        return 0.0
+    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
 
-    Returns (out_df, n_before_dedup, n_after_dedup, n_dominated_dropped,
-             archive_stem, archive_nfe), or None if no archive files.
-    """
-    # Decision columns for this policy kind.
-    if policy_kind == 'intertemporal':
-        dec_cols = [f'l{i}' for i in range(depth)]
-    elif policy_kind == 'table':
-        dec_cols = [f'n{i}' for i in range(2 ** depth - 1)]
+
+def _hv_mc(front_max, lo, hi, samples):
+    if len(front_max) == 0:
+        return 0.0
+    F = np.ascontiguousarray(front_max, float)
+    N = samples.shape[0]
+    dom = np.zeros(N, dtype=bool)
+    blk = 2000
+    for i in range(0, N, blk):
+        S = samples[i:i + blk]
+        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
+    return float(dom.mean() * np.prod(hi - lo))
+
+
+def _fixed_box(n_obj):
+    """Problem-level box loaded from params_config — same for every
+    paradigm/method/seed, ensuring HV ratios are comparable."""
+    from params_config import tree_box_dim2, tree_box_dim6
+    box = {2: tree_box_dim2, 6: tree_box_dim6}[n_obj]
+    nadir = np.asarray(box['nadir'], dtype=float)
+    ideal = np.asarray(box['ideal'], dtype=float)
+    if not np.all(ideal > nadir):
+        raise ValueError(
+            f'Degenerate box for tree dim={n_obj}: '
+            f'nadir={nadir.tolist()} ideal={ideal.tolist()}')
+    return nadir, ideal
+
+
+def _panel_machinery(cells, n_obj):
+    nadir, ideal = _fixed_box(n_obj)
+    box_volume = float(np.prod(ideal - nadir))
+
+    if n_obj == 2:
+        ref_min = -nadir
+        hv = lambda F: _hv_exact(np.clip(F, nadir, ideal), ref_min)
+        meta = dict(estimator='exact')
     else:
-        raise ValueError(f'unknown policy_kind: {policy_kind!r}')
+        rng = np.random.default_rng(MC_SEED)
+        samples = rng.uniform(nadir, ideal, size=(MC_SAMPLES_6OBJ, n_obj))
+        hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
+        meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
+                    mc_seed=MC_SEED)
 
-    # Collect archive files (skip our own outputs and any pruned files).
-    archive_files, stem, nfe = [], None, None
-    for fname in sorted(os.listdir(seed_dir)):
-        if fname.endswith('_evaluated.csv') or fname.endswith('_pruned.csv'):
-            continue
-        am = ARCHIVE_RE.match(fname)
-        if not am:
-            continue
-        stem, nfe, _ref_num = am.groups()
-        archive_files.append(os.path.join(seed_dir, fname))
-    if not archive_files:
-        return None
+    union = np.vstack([f for *_, f in cells])
+    best_known_hv = hv(union)
 
-    # Merge decision columns from all files; dedup identical policies.
-    parts = []
-    for fpath in archive_files:
-        df = pd.read_csv(fpath)
-        missing = [c for c in dec_cols if c not in df.columns]
-        if missing:
-            raise ValueError(
-                f'{fpath} missing decision columns: {missing[:5]}...')
-        parts.append(df[dec_cols])
-    merged = pd.concat(parts, ignore_index=True)
-    n_before = len(merged)
-    merged = merged.drop_duplicates(subset=dec_cols, ignore_index=True)
-    n_after = len(merged)
-
-    # One env per seed folder; slip pattern swapped in per scenario.
-    env = FruitTreeEnv(
-        depth=depth, reward_dim=n_obj, csv_path=csv_path,
-        observe=True, scenario_index=None, slip_patterns_path=None,
-    )
-
-    n_scen = len(eval_patterns)
-    means = np.zeros((len(merged), n_obj))
-    for i, row in merged.iterrows():
-        decisions = row.values
-        scenario_returns = np.zeros((n_scen, n_obj))
-        for s in range(n_scen):
-            env._slip_pattern = eval_patterns[s]
-            if policy_kind == 'intertemporal':
-                scenario_returns[s] = rollout_intertemporal(env, decisions)
-            else:
-                scenario_returns[s] = rollout_table(env, decisions, depth)
-        means[i] = scenario_returns.mean(axis=0)
-
-    # Pareto filter on the mean objectives (already minimization form).
-    nd_mask = _filter_non_dominated(means)
-    n_dom = int((~nd_mask).sum())
-
-    out = merged[nd_mask].reset_index(drop=True).copy()
-    means_nd = means[nd_mask]
-    for j in range(n_obj):
-        out[f'o{j + 1}_mean'] = means_nd[:, j]
-    out.insert(0, 'policy_id', np.arange(len(out)))
-
-    return out, n_before, n_after, n_dom, stem, nfe
+    meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
+                box_volume=box_volume, best_known_hv=best_known_hv,
+                n_union_points=int(len(union)))
+    return hv, box_volume, meta
 
 
-# ── Walker ────────────────────────────────────────────────────────────────────
-def walk_and_evaluate(base, csv_path_dim, eval_patterns_path):
-    if not os.path.isdir(base):
-        raise SystemExit(f'MOEA base not found: {base}')
-    if not os.path.exists(eval_patterns_path):
-        raise SystemExit(f'eval patterns not found: {eval_patterns_path}')
-
-    eval_patterns = np.load(eval_patterns_path)
-    print(f'Loaded {len(eval_patterns)} evaluation scenarios '
-          f'({eval_patterns.shape[1]} nodes each)\n')
-
-    # Discover robust cells.
-    cells = []
-    for d in sorted(os.listdir(base)):
-        m = FOLDER_RE.match(d)
-        if not m:
-            continue
-        policy_kind, algo, method, n_obj, obs = m.groups()
-        cells.append((d, policy_kind, algo, method, int(n_obj), obs))
-    if not cells:
-        raise SystemExit(f'No multi/moro cells found under {base}')
-    print(f'Found {len(cells)} robust MOEA cell(s)\n')
-
-    t0 = time.time()
-    n_seeds_done = 0
-    for cell_dir, policy_kind, algo, method, n_obj, obs in cells:
-        print(f'{cell_dir}  [{policy_kind}, {algo}, {method}, {n_obj}-obj]')
-        cell_path = os.path.join(base, cell_dir)
-        csv_path = csv_path_dim[n_obj]
-
-        seed_folders = sorted(
-            sd for sd in os.listdir(cell_path)
-            if os.path.isdir(os.path.join(cell_path, sd))
-        )
-        for sd in seed_folders:
-            seed_dir = os.path.join(cell_path, sd)
-            result = evaluate_seed_folder(
-                seed_dir, policy_kind, n_obj, TREE_DEPTH,
-                csv_path, eval_patterns)
-            if result is None:
-                print(f'    {sd}: no archive files — skipped')
-                continue
-            out, n_before, n_after, n_dom, stem, nfe = result
-            out_name = f'archives_{stem}_{nfe}_evaluated.csv'
-            out.to_csv(os.path.join(seed_dir, out_name), index=False)
-            print(f'    {sd}: {n_before} rows → {n_after} unique '
-                  f'({n_before - n_after} dup) → {len(out)} non-dominated '
-                  f'({n_dom} dom) → {out_name}')
-            n_seeds_done += 1
-        print()
-
-    print(f'Done. {n_seeds_done} seed folder(s) written in '
-          f'{time.strftime("%H:%M:%S", time.gmtime(time.time() - t0))}')
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 if __name__ == '__main__':
-    walk_and_evaluate(
-        base=MOEA_BASE,
-        csv_path_dim=CSV_PATH_DIM,
-        eval_patterns_path=EVAL_PATTERNS_PATH,
-    )
+    print('=' * 64)
+    print(f'EVALUATING setting = {SETTING} (tree)')
+    print('=' * 64)
+
+    cells = list(_enabled_cells())
+    if not cells:
+        print(f'  no enabled+available runs for {SETTING} — '
+              f'check INPUT_ROOT={INPUT_ROOT}')
+        raise SystemExit(1)
+
+    # Report what was found
+    by_para = defaultdict(set)
+    for paradigm, method, cond, n_obj, _, _ in cells:
+        by_para[paradigm].add((method, cond, n_obj))
+    print(f'\nfound {len(cells)} fronts across paradigms:')
+    for p in sorted(by_para):
+        print(f'  {p}: {len(by_para[p])} (method, condition, n_obj) cells')
+
+    by_nobj = defaultdict(list)
+    for c in cells:
+        by_nobj[c[3]].append(c)
+
+    rows = []
+    meta = {'setting': SETTING,
+            'kind': 'evaluation_moea',
+            'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'scope': {
+                'moea': [k for k, v in run_moea_method.items() if v],
+                'policy': [k for k, v in run_policy.items() if v],
+                'observability': [k for k, v in run_observability.items() if v],
+                'n_obj': [k for k, v in run_n_obj.items() if v],
+            },
+            'note': ('Deterministic MOEA HV scoring. Archives stored '
+                     'MIN-conv (negated to MAX). Fixed HV box from '
+                     'params_config — identical to the box used for MORL '
+                     'scoring in tree_morl_reeval.py, so HV ratios are '
+                     'directly comparable across paradigms.'),
+            'panels': {}}
+
+    for n_obj, panel_cells in sorted(by_nobj.items()):
+        hv, box_volume, pmeta = _panel_machinery(panel_cells, n_obj)
+        meta['panels'][str(n_obj)] = pmeta
+        print(f'\n n_obj={n_obj}: {len(panel_cells)} runs, '
+              f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
+              f"best-known HV={pmeta['best_known_hv']:.5g} "
+              f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
+        for paradigm, method, cond, no, seed, F in panel_cells:
+            h = hv(F)
+            rows.append(dict(
+                paradigm=paradigm, method=method, condition=cond,
+                n_obj=no, seed=seed, n_solutions=int(len(F)),
+                hv=h, box_volume=box_volume,
+                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
+        agg = defaultdict(list)
+        for r in rows:
+            if r['n_obj'] == n_obj:
+                agg[(r['paradigm'], r['method'], r['condition'])].append(
+                    r['hv_ratio'])
+        for (p, m, c), vs in sorted(agg.items()):
+            print(f'   {p:4s} {m:14s} {c:24s} n={len(vs):2d} '
+                  f'HVr={np.mean(vs):.4f}±{np.std(vs):.4f}')
+
+    out_dir = os.path.join(OUTPUT_ROOT, SETTING, 'moea')
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.DataFrame(rows).sort_values(
+        ['n_obj', 'paradigm', 'method', 'condition', 'seed'])
+    df.to_csv(os.path.join(out_dir, 'metrics_long_reeval.csv'), index=False)
+    with open(os.path.join(out_dir, '_meta_reeval.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'\n  wrote {out_dir}/metrics_long_reeval.csv  ({len(df)} rows)')
+    print(f'  wrote {out_dir}/_meta_reeval.json')

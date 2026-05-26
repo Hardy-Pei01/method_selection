@@ -64,7 +64,7 @@ def two_lake_dps(num_obj, alpha, delta, total_years, years_per_action, **kwargs)
 
 
 def two_lake_inter_robust(num_obj, alpha, delta, total_years, years_per_action,
-                          b1=0.42, q1=2.0, b2=0.35, q2=2.5,
+                          b1=0.42, q1=2.5, b2=0.35, q2=3.0,
                           inflow_seed1=None, inflow_seed2=None,
                           Pcrit1=None, Pcrit2=None, **kwargs):
     n_steps = total_years // years_per_action
@@ -84,7 +84,7 @@ def two_lake_inter_robust(num_obj, alpha, delta, total_years, years_per_action,
 
 
 def two_lake_dps_robust(num_obj, alpha, delta, total_years, years_per_action,
-                        b1=0.42, q1=2.0, b2=0.35, q2=2.5,
+                        b1=0.42, q1=2.5, b2=0.35, q2=3.0,
                         inflow_seed1=None, inflow_seed2=None,
                         Pcrit1=None, Pcrit2=None, **kwargs):
     env = TwoLakeEnv(
@@ -127,36 +127,26 @@ def _run_constrained_episode(env, actions):
     """Run an intertemporal episode; return MIN-convention objectives."""
     env.reset()
     total_rewards = np.zeros(env.num_obj, dtype=np.float32)
-    info = {}
     for u1, u2 in actions:
         action = np.array([u1, u2], dtype=np.int64)
-        _, rewards, _, _, info = env.step(action)
+        _, rewards, _, _, _ = env.step(action)
         total_rewards -= np.array(rewards, dtype=np.float32)
 
-    out = {f'o{i + 1}': float(total_rewards[i]) for i in range(env.num_obj)}
-    out['n_violations_1'] = int(info['n_violations_1'])
-    if env.num_obj != 2:
-        out['n_violations_2'] = int(info['n_violations_2'])
-    return out
+    return {f'o{i + 1}': float(total_rewards[i]) for i in range(env.num_obj)}
 
 
 def _run_constrained_dps_episode(env, c1_1, c2_1, r1_1, r2_1, w1_1,
                                  c1_2, c2_2, r1_2, r2_2, w1_2):
     """Run a DPS episode; return MIN-convention objectives. Penalty stays in."""
     total_rewards = np.zeros(env.num_obj, dtype=np.float32)
-    info = {}
     for _ in range(env.n_gym_steps):
         X1, X2 = env.X1, env.X2
         u1 = get_emission(X1, c1_1, c2_1, r1_1, r2_1, w1_1)
         u2 = get_emission(X2, c1_2, c2_2, r1_2, r2_2, w1_2)
-        _, rewards, _, _, info = env.step(np.array([u1, u2], dtype=np.int64))
+        _, rewards, _, _, _ = env.step(np.array([u1, u2], dtype=np.int64))
         total_rewards -= np.array(rewards, dtype=np.float32)
 
-    out = {f'o{i + 1}': float(total_rewards[i]) for i in range(env.num_obj)}
-    out['n_violations_1'] = int(info['n_violations_1'])
-    if env.num_obj != 2:
-        out['n_violations_2'] = int(info['n_violations_2'])
-    return out
+    return {f'o{i + 1}': float(total_rewards[i]) for i in range(env.num_obj)}
 
 
 def constrained_two_lake_inter(num_obj, alpha, delta, total_years,
@@ -190,7 +180,7 @@ def constrained_two_lake_dps(num_obj, alpha, delta, total_years,
 
 def constrained_two_lake_inter_robust(num_obj, alpha, delta, total_years,
                                       years_per_action,
-                                      b1=0.42, q1=2.0, b2=0.35, q2=2.5,
+                                      b1=0.42, q1=2.5, b2=0.35, q2=3.0,
                                       inflow_seed1=None, inflow_seed2=None,
                                       Pcrit1=None, Pcrit2=None, **kwargs):
     n_steps = total_years // years_per_action
@@ -208,7 +198,7 @@ def constrained_two_lake_inter_robust(num_obj, alpha, delta, total_years,
 
 def constrained_two_lake_dps_robust(num_obj, alpha, delta, total_years,
                                     years_per_action,
-                                    b1=0.42, q1=2.0, b2=0.35, q2=2.5,
+                                    b1=0.42, q1=2.5, b2=0.35, q2=3.0,
                                     inflow_seed1=None, inflow_seed2=None,
                                     Pcrit1=None, Pcrit2=None, **kwargs):
     env = ConstrainedTwoLakeEnv(

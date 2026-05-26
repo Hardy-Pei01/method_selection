@@ -1,369 +1,216 @@
-from __future__ import annotations
-
-import argparse
-import os
-import re
-import sys
-import time
-import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-
+import os, re, glob, json, time
 import numpy as np
 import pandas as pd
+from collections import defaultdict
+from moocore import hypervolume as _exact_hv
 
-from two_lake import TwoLakeEnv
+# ----------------------------------------------------------------------
+# Experiment selection — flip 1/0
+# ----------------------------------------------------------------------
+INPUT_ROOT = '../data/lake_data_2/'
+OUTPUT_ROOT = '../data/lake_data_2'
+SETTING = 'deterministic'  # robust uses robust_lake_moea_reeval.py
 
-try:
-    from moocore import is_nondominated as _moocore_is_nd
-except ImportError:
-    _moocore_is_nd = None
+run_moea_method = {
+    'NSGAII': 1,
+    'IBEA': 1,
+    'MOEAD': 1,
+}
+run_policy = {
+    'intertemporal': 1,
+    'dps': 1,
+}
+run_n_obj = {2: 1, 6: 1}
 
-FOLDER_RE = re.compile(
-    r'^(intertemporal|dps)'
-    r'_(NSGAII|IBEA|MOEAD)'
-    r'_(multi|moro)'
-    r'_(\d+)$'
-)
-
-ARCHIVE_RE = re.compile(r'^archives_(.+?)_(\d+)(?:_(\d+))?\.csv$')
-
-_OBJ_COL_RE = re.compile(r'^(o\d+|p\d+_o\d+)$')
-_META_COLS = {'reference_scenario'}
-
-
-def detect_dec_cols(df: pd.DataFrame) -> List[str]:
-    return [
-        c for c in df.columns
-        if c not in _META_COLS
-           and not _OBJ_COL_RE.match(c)
-           and not c.startswith('Unnamed')
-    ]
+MC_SAMPLES_6OBJ = 50_000
+MC_SEED = 12345
 
 
-def build_env(scenario: np.void, n_obj: int) -> TwoLakeEnv:
-    return TwoLakeEnv(
-        b1=float(scenario['b1']),
-        q1=float(scenario['q1']),
-        b2=float(scenario['b2']),
-        q2=float(scenario['q2']),
-        inflow_seed1=int(scenario['inflow_seed1']),
-        inflow_seed2=int(scenario['inflow_seed2']),
-        Pcrit1=float(scenario['Pcrit1']),
-        Pcrit2=float(scenario['Pcrit2']),
-        num_obj=n_obj,
-    )
+# ----------------------------------------------------------------------
+# Front loading — deterministic single-scenario MOEA: stored o* IS the
+# realised return, so we read it directly (no env replay).
+# ----------------------------------------------------------------------
+def _obj_cols(df):
+    return sorted(
+        [c for c in df.columns if re.fullmatch(r'o\d+', c)],
+        key=lambda c: int(re.search(r'\d+', c).group()))
 
 
-# ── Rollout functions ─────────────────────────────────────────────────────────
-
-def rollout_intertemporal(env: TwoLakeEnv, row: pd.Series) -> np.ndarray:
-    env.reset()
-    n_steps = env.n_gym_steps
-    total = np.zeros(env.num_obj, dtype=np.float64)
-    for i in range(n_steps):
-        u1 = int(row[f'u1_{i}'])
-        u2 = int(row[f'u2_{i}'])
-        _, rewards, _, _, _ = env.step(np.array([u1, u2], dtype=np.int64))
-        total -= rewards  # negate: positive cost = worse
-    return total
+def _front_maxconv(path):
+    """MOEA archives are MIN-conv -> negate to MAX-conv."""
+    df = pd.read_csv(path)
+    v = df[_obj_cols(df)].values.astype(float)
+    return -v
 
 
-def _get_emission(xt: float,
-                  c1: float, c2: float,
-                  r1: float, r2: float,
-                  w1: float) -> int:
-    rule = w1 * (abs(xt - c1) / r1) ** 3 + (1 - w1) * (abs(xt - c2) / r2) ** 3
-    u = float(np.clip(rule, 0.0, 0.10))
-    return int(round(u / 0.02))
+def _seed_dirs(base, stem):
+    root = os.path.join(base, stem)
+    if not os.path.isdir(root):
+        return []
+    return sorted(d for d in glob.glob(os.path.join(root, 'seed*'))
+                  if os.path.isdir(d))
 
 
-def rollout_dps(env: TwoLakeEnv, row: pd.Series) -> np.ndarray:
-    env.reset()
-    # Lake 1 RBF parameters
-    c1_1, c2_1 = float(row['c1_1']), float(row['c2_1'])
-    r1_1, r2_1 = float(row['r1_1']), float(row['r2_1'])
-    w1_1 = float(row['w1_1'])
-    # Lake 2 RBF parameters
-    c1_2, c2_2 = float(row['c1_2']), float(row['c2_2'])
-    r1_2, r2_2 = float(row['r1_2']), float(row['r2_2'])
-    w1_2 = float(row['w1_2'])
-
-    total = np.zeros(env.num_obj, dtype=np.float64)
-    for _ in range(env.n_gym_steps):
-        X1, X2 = env.X1, env.X2
-        u1 = _get_emission(X1, c1_1, c2_1, r1_1, r2_1, w1_1)
-        u2 = _get_emission(X2, c1_2, c2_2, r1_2, r2_2, w1_2)
-        _, rewards, _, _, _ = env.step(np.array([u1, u2], dtype=np.int64))
-        total -= rewards
-    return total
+def _only_csv(folder, prefix):
+    hits = [f for f in os.listdir(folder)
+            if f.startswith(prefix) and f.endswith('.csv')
+            and not f.endswith('_evaluated.csv')]
+    return os.path.join(folder, hits[0]) if hits else None
 
 
-def _is_nondominated(values: np.ndarray) -> np.ndarray:
-    arr = np.asarray(values, dtype=float)
-    if arr.shape[0] <= 1:
-        return np.ones(arr.shape[0], dtype=bool)
-    if _moocore_is_nd is not None:
-        return _moocore_is_nd(arr)
-    # O(n²) fallback
-    n = arr.shape[0]
-    keep = np.ones(n, dtype=bool)
-    for i in range(n):
-        if not keep[i]:
+def _enabled_cells():
+    """Yield (paradigm, method, condition, n_obj, seed_idx, front_maxconv)."""
+    moea_base = os.path.join(INPUT_ROOT, SETTING, 'moea')
+    for n_obj, on in run_n_obj.items():
+        if not on:
             continue
-        for j in range(n):
-            if i == j or not keep[j]:
+        for method, m_on in run_moea_method.items():
+            if not m_on:
                 continue
-            if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
-                keep[i] = False
-                break
-    return keep
+            for policy, p_on in run_policy.items():
+                if not p_on:
+                    continue
+                stem = f'{policy}_{method}_single_{n_obj}'
+                sds = _seed_dirs(moea_base, stem)
+                if not sds:
+                    continue
+                cond = f'{policy}_single'
+                for sd in sds:
+                    csv = _only_csv(sd, 'archives_')
+                    if csv:
+                        k = int(re.search(r'seed(\d+)', sd).group(1))
+                        yield ('MOEA', method, cond, n_obj, k,
+                               _front_maxconv(csv))
 
 
-def _eval_one_policy(
-        i: int,
-        row: pd.Series,
-        policy_kind: str,
-        eval_scenarios: np.ndarray,
-        n_obj: int,
-) -> Tuple[int, np.ndarray]:
-    n_scen = len(eval_scenarios)
-    returns = np.zeros((n_scen, n_obj), dtype=np.float64)
-
-    for s in range(n_scen):
-        env = build_env(eval_scenarios[s], n_obj)
-        if policy_kind == 'intertemporal':
-            returns[s] = rollout_intertemporal(env, row)
-        elif policy_kind == 'dps':
-            returns[s] = rollout_dps(env, row)
-        else:
-            raise ValueError(f'Unknown policy_kind: {policy_kind!r}')
-
-    return i, returns.mean(axis=0)
+# ----------------------------------------------------------------------
+# Hypervolume (MAX convention) — IDENTICAL to lake_morl_reeval.py
+# ----------------------------------------------------------------------
+def _hv_exact(front_max, ref_min):
+    if len(front_max) == 0:
+        return 0.0
+    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
 
 
-@dataclass
-class CellSpec:
-    folder_path: str
-    policy_kind: str
-    algo: str
-    method: str
-    n_obj: int
-    archive_files: List[Tuple[str, Optional[int]]] = field(default_factory=list)
-    archive_stem: Optional[str] = None
-    archive_nfe: Optional[str] = None
+def _hv_mc(front_max, lo, hi, samples):
+    if len(front_max) == 0:
+        return 0.0
+    F = np.ascontiguousarray(front_max, float)
+    N = samples.shape[0]
+    dom = np.zeros(N, dtype=bool)
+    blk = 2000
+    for i in range(0, N, blk):
+        S = samples[i:i + blk]
+        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
+    return float(dom.mean() * np.prod(hi - lo))
 
 
-def evaluate_cell(
-        spec: CellSpec,
-        eval_scenarios: np.ndarray,
-        policy_workers: int,
-) -> dict:
-    t0 = time.monotonic()
-
-    # 1. Read and merge archives; detect decision columns from first file
-    first_df = pd.read_csv(spec.archive_files[0][0])
-    dec_cols = detect_dec_cols(first_df)
-
-    parts = []
-    for fpath, _ in spec.archive_files:
-        df = pd.read_csv(fpath)
-        parts.append(df[dec_cols])
-
-    merged = pd.concat(parts, ignore_index=True)
-    n_before = len(merged)
-    merged = merged.drop_duplicates(subset=dec_cols, ignore_index=True)
-    n_after = len(merged)
-
-    # 2. Evaluate policies in parallel across a thread pool
-    n_policies = len(merged)
-    means = np.zeros((n_policies, spec.n_obj), dtype=np.float64)
-
-    futures_map: dict = {}
-    with ThreadPoolExecutor(max_workers=policy_workers) as executor:
-        for i, row in merged.iterrows():
-            fut = executor.submit(
-                _eval_one_policy,
-                i, row, spec.policy_kind, eval_scenarios, spec.n_obj,
-            )
-            futures_map[fut] = i
-
-        for fut in as_completed(futures_map):
-            idx, row_means = fut.result()
-            means[idx] = row_means
-
-    # 3. Pareto filter
-    nd_mask = _is_nondominated(means)
-    n_dom_dropped = int((~nd_mask).sum())
-
-    out = merged[nd_mask].reset_index(drop=True).copy()
-    means_nd = means[nd_mask]
-    for j in range(spec.n_obj):
-        out[f'o{j + 1}_mean'] = means_nd[:, j]
-    out.insert(0, 'policy_id', np.arange(len(out)))
-
-    # 4. Save
-    out_name = f'archives_{spec.archive_stem}_{spec.archive_nfe}_evaluated.csv'
-    out_path = os.path.join(spec.folder_path, out_name)
-    out.to_csv(out_path, index=False)
-
-    elapsed = time.monotonic() - t0
-    return {
-        'folder': os.path.basename(spec.folder_path),
-        'n_files': len(spec.archive_files),
-        'n_before': n_before,
-        'n_after_dedup': n_after,
-        'n_dup': n_before - n_after,
-        'n_nd': len(out),
-        'n_dom': n_dom_dropped,
-        'out_name': out_name,
-        'elapsed_s': elapsed,
-    }
+def _fixed_box(n_obj):
+    from params_config import (lake_box_deterministic_dim2,
+                               lake_box_deterministic_dim6)
+    box = {2: lake_box_deterministic_dim2,
+           6: lake_box_deterministic_dim6}[n_obj]
+    nadir = np.asarray(box['nadir'], dtype=float)
+    ideal = np.asarray(box['ideal'], dtype=float)
+    if not np.all(ideal > nadir):
+        raise ValueError(f'Degenerate box for lake dim={n_obj}')
+    return nadir, ideal
 
 
-def _cell_worker(args: tuple) -> dict:
-    spec, eval_scenarios, policy_workers = args
-    try:
-        return evaluate_cell(spec, eval_scenarios, policy_workers)
-    except Exception:
-        return {
-            'folder': os.path.basename(spec.folder_path),
-            'error': traceback.format_exc(),
-        }
+def _panel_machinery(cells, n_obj):
+    nadir, ideal = _fixed_box(n_obj)
+    box_volume = float(np.prod(ideal - nadir))
+    if n_obj == 2:
+        ref_min = -nadir
+        hv = lambda F: _hv_exact(np.clip(F, nadir, ideal), ref_min)
+        meta = dict(estimator='exact')
+    else:
+        rng = np.random.default_rng(MC_SEED)
+        samples = rng.uniform(nadir, ideal, size=(MC_SAMPLES_6OBJ, n_obj))
+        hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
+        meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
+                    mc_seed=MC_SEED)
+    union = np.vstack([c[-1] for c in cells])
+    best_known_hv = hv(union)
+    meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
+                box_volume=box_volume, best_known_hv=best_known_hv,
+                n_union_points=int(len(union)))
+    return hv, box_volume, meta
 
 
-def discover_cells(base: str) -> List[CellSpec]:
-    cells = []
-    for d in sorted(os.listdir(base)):
-        m = FOLDER_RE.match(d)
-        if not m:
-            continue
-        policy_kind, algo, method, n_obj_str = m.groups()
-        n_obj = int(n_obj_str)
-        folder_path = os.path.join(base, d)
-
-        archive_files = []
-        archive_stem = None
-        archive_nfe = None
-
-        for fname in sorted(os.listdir(folder_path)):
-            if fname.endswith('_evaluated.csv'):
-                continue
-            if not fname.startswith('archives_'):
-                continue
-            am = ARCHIVE_RE.match(fname)
-            if not am or '_pruned' in fname:
-                continue
-            stem, nfe, ref_num = am.groups()
-            ref_num = int(ref_num) if ref_num is not None else None
-            archive_files.append((os.path.join(folder_path, fname), ref_num))
-            archive_stem = stem
-            archive_nfe = nfe
-
-        if not archive_files:
-            continue
-
-        cells.append(CellSpec(
-            folder_path=folder_path,
-            policy_kind=policy_kind,
-            algo=algo,
-            method=method,
-            n_obj=n_obj,
-            archive_files=archive_files,
-            archive_stem=archive_stem,
-            archive_nfe=archive_nfe,
-        ))
-    return cells
-
-
-def walk_and_evaluate(
-        base: str,
-        eval_scenarios_path: str,
-        cell_workers: int = 0,
-        policy_workers: int = 4,
-        dry_run: bool = False,
-) -> None:
-    eval_scenarios = np.load(eval_scenarios_path)
-    print(f'Loaded {len(eval_scenarios)} evaluation scenarios '
-          f'from {eval_scenarios_path}')
-
-    cells = discover_cells(base)
-    print(f'Discovered {len(cells)} cells to evaluate.')
-
-    if dry_run:
-        for spec in cells:
-            print(f'  [{spec.policy_kind}] {os.path.basename(spec.folder_path)}'
-                  f' — {len(spec.archive_files)} file(s)')
-        return
-
-    n_workers = cell_workers or os.cpu_count() or 4
-    n_workers = min(n_workers, len(cells))
-    print(f'Processing with up to {n_workers} cell worker(s), '
-          f'{policy_workers} policy thread(s) each.\n')
-
-    work_items = [(spec, eval_scenarios, policy_workers) for spec in cells]
-
-    t_start = time.monotonic()
-    n_done = 0
-    n_errors = 0
-
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_cell_worker, item): item[0]
-                   for item in work_items}
-
-        for fut in as_completed(futures):
-            result = fut.result()
-            n_done += 1
-
-            if 'error' in result:
-                n_errors += 1
-                print(f'  ERROR in {result["folder"]}:\n{result["error"]}',
-                      file=sys.stderr)
-            else:
-                r = result
-                print(
-                    f'  [{n_done:2d}/{len(cells)}] {r["folder"]}: '
-                    f'{r["n_files"]} file(s), '
-                    f'{r["n_before"]} → {r["n_after_dedup"]} '
-                    f'(−{r["n_dup"]} dup) → {r["n_nd"]} ND '
-                    f'(−{r["n_dom"]} dom) | {r["elapsed_s"]:.1f}s '
-                    f'→ {r["out_name"]}'
-                )
-
-    elapsed = time.monotonic() - t_start
-    status = 'with errors' if n_errors else 'successfully'
-    print(f'\nDone {status}. {n_done - n_errors}/{len(cells)} cells written '
-          f'in {elapsed:.1f}s.')
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument('--base', default='../lake_data/moea_robust',
-                   help='Root folder containing the cell subdirectories')
-    p.add_argument('--eval-scenarios',
-                   default='../lakes/lake_scenarios_eval.npy',
-                   dest='eval_scenarios',
-                   help='Path to the structured numpy array of evaluation scenarios')
-    p.add_argument('--workers', type=int, default=0,
-                   help='Cell-level worker processes (0 = os.cpu_count())')
-    p.add_argument('--policy-workers', type=int, default=4,
-                   dest='policy_workers',
-                   help='Threads per cell for policy evaluation (default: 4)')
-    p.add_argument('--dry-run', action='store_true',
-                   help='Discover and list cells without evaluating')
-    return p.parse_args()
-
-
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 if __name__ == '__main__':
-    args = _parse_args()
-    walk_and_evaluate(
-        base=args.base,
-        eval_scenarios_path=args.eval_scenarios,
-        cell_workers=args.workers,
-        policy_workers=args.policy_workers,
-        dry_run=args.dry_run,
-    )
+    print('=' * 64)
+    print(f'EVALUATING setting = {SETTING} (lake, MOEA)')
+    print('=' * 64)
+
+    cells = list(_enabled_cells())
+    if not cells:
+        print(f'  no enabled+available runs for {SETTING} — '
+              f'check INPUT_ROOT={INPUT_ROOT}')
+        raise SystemExit(1)
+
+    by_para = defaultdict(set)
+    for paradigm, method, cond, n_obj, _, _ in cells:
+        by_para[paradigm].add((method, cond, n_obj))
+    print(f'\nfound {len(cells)} fronts:')
+    for p in sorted(by_para):
+        print(f'  {p}: {len(by_para[p])} (method, condition, n_obj) cells')
+
+    by_nobj = defaultdict(list)
+    for c in cells:
+        by_nobj[c[3]].append(c)
+
+    rows = []
+    meta = {'setting': SETTING,
+            'kind': 'evaluation_moea',
+            'source': 'archives_*.csv stored o* (no env replay)',
+            'aggregation': 'identity (single-scenario archive values)',
+            'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'scope': {
+                'moea': [k for k, v in run_moea_method.items() if v],
+                'policy': [k for k, v in run_policy.items() if v],
+                'n_obj': [k for k, v in run_n_obj.items() if v],
+            },
+            'note': ('Deterministic MOEA HV scoring. Single-scenario '
+                     'archives store realised o* directly (MIN-conv); '
+                     'negated to MAX-conv. Fixed HV box from '
+                     'params_config — identical to the box used for '
+                     'MORL scoring in lake_morl_reeval.py, so HV ratios '
+                     'are directly comparable across paradigms.'),
+            'panels': {}}
+
+    for n_obj, panel_cells in sorted(by_nobj.items()):
+        hv, box_volume, pmeta = _panel_machinery(panel_cells, n_obj)
+        meta['panels'][str(n_obj)] = pmeta
+        print(f'\n n_obj={n_obj}: {len(panel_cells)} runs, '
+              f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
+              f"best-known HV={pmeta['best_known_hv']:.5g} "
+              f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
+        for paradigm, method, cond, no, seed, F in panel_cells:
+            h = hv(F)
+            rows.append(dict(
+                paradigm=paradigm, method=method, condition=cond,
+                n_obj=no, seed=seed, n_solutions=int(len(F)),
+                hv=h, box_volume=box_volume,
+                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
+        agg = defaultdict(list)
+        for r in rows:
+            if r['n_obj'] == n_obj:
+                agg[(r['paradigm'], r['method'], r['condition'])].append(
+                    r['hv_ratio'])
+        for (p, m, c), vs in sorted(agg.items()):
+            print(f'   {p:4s} {m:14s} {c:24s} n={len(vs):2d} '
+                  f'HVr={np.mean(vs):.4f}±{np.std(vs):.4f}')
+
+    out_dir = os.path.join(OUTPUT_ROOT, SETTING, 'moea')
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.DataFrame(rows).sort_values(
+        ['n_obj', 'paradigm', 'method', 'condition', 'seed'])
+    df.to_csv(os.path.join(out_dir, 'metrics_long_reeval.csv'), index=False)
+    with open(os.path.join(out_dir, '_meta_reeval.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'\n  wrote {out_dir}/metrics_long_reeval.csv  ({len(df)} rows)')
+    print(f'  wrote {out_dir}/_meta_reeval.json')

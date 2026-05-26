@@ -1,71 +1,126 @@
-"""Re-evaluate robust MORL (PQL) policies for the CONSTRAINED two-lake problem
-(multi and moro) on a held-out evaluation scenario set.
-
-Ported from the unconstrained-lake re-evaluation program. The only
-problem-specific changes are:
-  - imports `TwoLakeEnv` from `constrained_two_lake` (the constrained env:
-    MAX_P_THRESHOLD violation penalty folded into every reward axis);
-  - `_load_agent` is gzip-aware, since the current pql.py writes gzip-
-    compressed payloads (older plain-pickle payloads still load).
-Everything else — the PQL target-vector tracking, the Q-cache, the
-non-domination filter, the cell/agent discovery — is unchanged, because the
-constrained env has the *same* observation/action spaces and the same
-constructor signature as the unconstrained one; the constraint only changes
-the reward values, which re-evaluation simply measures.
-
-Each archive vector of a PQL agent is a "target"; target-vector tracking
-through the Q-table induces one deterministic policy. Multi cells train one
-agent per reference scenario (ref 0..N); moro cells train one agent.
-Evaluate every (agent, target) policy across all eval scenarios, take the
-mean objective vector, drop dominated, write one `*_evaluated.csv` per cell.
-
-Output objective columns o1_mean..on_mean are in MIN-form (negated rewards),
-matching the MOEA archive sign convention so both paradigms compare directly.
-
-Usage:
-    python evaluate_constrained_lake_morl_robust.py \
-        --base ../constrained_lake_data/robust/morl \
-        --eval-scenarios ../lakes/lake_scenarios_eval.npy
-"""
-from __future__ import annotations
-
-import argparse
-import gzip
-import os
-import pickle
-import re
-import sys
-import time
-import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-
+import os, re, gzip, pickle, glob, json, time
 import numpy as np
 import pandas as pd
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from constrained_two_lake import ConstrainedTwoLakeEnv as TwoLakeEnv
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from constrained_two_lake import ConstrainedTwoLakeEnv
 from morl.pql import PQL
 
 try:
-    from moocore import is_nondominated as _moocore_is_nd
+    from moocore import is_nondominated as _moo_is_nd
 except ImportError:
-    _moocore_is_nd = None
+    _moo_is_nd = None
 
+# ----------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------
+INPUT_ROOT  = '../data/constrained_data_1/'
+OUTPUT_ROOT = '../data/constrained_data_1'
+
+# 'deterministic' or 'robust'
+SETTING = 'robust'
+
+EVAL_SCENARIOS_PATH = '../lakes/lake_scenarios_eval.npy'   # (1000,) struct
+
+run_scoring = {'pareto': 1, 'indicator': 1, 'decomposition': 1}
+run_scenario_method_for_setting = {
+    'deterministic': ['single'],
+    'robust':        ['multi', 'moro'],
+}
+run_n_obj = {2: 1, 6: 1}
+
+# Cap on archive size per agent. Crowding-distance subsample before
+# rollouts. Set to None to disable.
+MAX_POLICIES_PER_AGENT = 1000
+
+# Parallelism: 0 = auto (os.cpu_count()), 1 = serial (debug), N>0 = N workers
+N_WORKERS = 0
+
+# Stem-folder pattern (mirrors lake_morl_reeval.py): seeds are
+# subdirectories `seed*/` inside each stem.
 FOLDER_RE = re.compile(
-    r'^(pareto|indicator|decomposition)_(multi|moro)_(\d+)(?:_seed(\d+))?$'
-)
-AGENT_RE = re.compile(r'^agent_(.+?)_(\d+)(?:_(\d+))?\.pkl$')
-
-MAX_POLICIES_PER_AGENT = 500
+    r'^(pareto|indicator|decomposition)_(single|multi|moro)_(\d+)$')
+AGENT_RE  = re.compile(r'^agent_(\d+)(?:_(\d+))?\.pkl$')
 
 
-# ── Q-table machinery ─────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
+# Worker-global state (set by ProcessPoolExecutor initializer)
+# ----------------------------------------------------------------------
+_EVAL_SCENARIOS = None
+
+
+def _worker_init(scenarios):
+    global _EVAL_SCENARIOS
+    _EVAL_SCENARIOS = scenarios
+
+
+# ----------------------------------------------------------------------
+# Scenario loading
+# ----------------------------------------------------------------------
+def _scenario_dict_from_struct(s):
+    return {
+        'b1': float(s['b1']), 'q1': float(s['q1']),
+        'b2': float(s['b2']), 'q2': float(s['q2']),
+        'inflow_seed1': int(s['inflow_seed1']),
+        'inflow_seed2': int(s['inflow_seed2']),
+        'Pcrit1': float(s['Pcrit1']) if s['Pcrit1'] is not None else None,
+        'Pcrit2': float(s['Pcrit2']) if s['Pcrit2'] is not None else None,
+    }
+
+
+def _build_env(scenario_dict, n_obj):
+    return ConstrainedTwoLakeEnv(
+        b1=scenario_dict['b1'], q1=scenario_dict['q1'],
+        b2=scenario_dict['b2'], q2=scenario_dict['q2'],
+        inflow_seed1=scenario_dict['inflow_seed1'],
+        inflow_seed2=scenario_dict['inflow_seed2'],
+        Pcrit1=scenario_dict.get('Pcrit1'),
+        Pcrit2=scenario_dict.get('Pcrit2'),
+        num_obj=n_obj,
+    )
+
+
+def _load_deterministic_morl_scenario():
+    """MORL is trained at default_lake_scenario. Re-evaluate there too."""
+    from params_config import default_lake_scenario
+    return [_scenario_dict_from_struct(default_lake_scenario)]
+
+
+def _load_robust_eval_scenarios(path):
+    arr = np.load(path)
+    return [_scenario_dict_from_struct(s) for s in arr]
+
+
+# ----------------------------------------------------------------------
+# PQL agent loading
+# ----------------------------------------------------------------------
+def _load_agent(agent_path, n_obj):
+    with open(agent_path, 'rb') as f:
+        magic = f.read(2)
+    opener = gzip.open if magic == b'\x1f\x8b' else open
+    with opener(agent_path, 'rb') as f:
+        payload = pickle.load(f)
+    cfg = payload['config']
+    saved_robust = bool(cfg.get('robust', False))
+    n_scenarios = payload.get('n_scenarios') if saved_robust else None
+
+    env = ConstrainedTwoLakeEnv(num_obj=n_obj)
+    kwargs = dict(env=env, ref_point=np.asarray(cfg['ref_point']))
+    if saved_robust and n_scenarios is not None:
+        kwargs['robust'] = True
+        kwargs['n_scenarios'] = n_scenarios
+    agent = PQL(**kwargs)
+    agent.load_q_table(agent_path)
+    return agent
+
+
+# ----------------------------------------------------------------------
+# Q-cache + target-tracking rollout
+# ----------------------------------------------------------------------
 def _build_q_cache(agent, decomp):
-    """For each visited (state, action), cache (Q, Qsa) arrays.
-    Q is the raw nd-set; Qsa = gamma * Q + avg_reward is the realised-return
-    estimate. Built once per agent, reused for every rollout.
-    """
     cache = {}
     gamma = agent.gamma
     nd_dict = agent.nd_decomp if decomp else agent.non_dominated
@@ -78,8 +133,7 @@ def _build_q_cache(agent, decomp):
             if not nd_set:
                 continue
             Q = np.array(list(nd_set), dtype=float)
-            im_rew = agent.avg_reward[state][a]
-            Qsa = gamma * Q + im_rew
+            Qsa = gamma * Q + agent.avg_reward[state][a]
             per_action[a] = (Q, Qsa)
         if per_action:
             cache[state] = per_action
@@ -87,18 +141,11 @@ def _build_q_cache(agent, decomp):
 
 
 def _pick_action_cached(cache, state_flat, target):
-    """Pick (action, next_target) by L1-matching the target against each
-    action's Qsa rows. The matched raw Q row is, by construction, the
-    remaining-return target for the next state. Unvisited state -> action 0,
-    target unchanged.
-    """
     per_action = cache.get(state_flat)
     if per_action is None:
         return 0, target, False
 
-    best_action = None
-    best_dist = np.inf
-    next_target = target
+    best_action, best_dist, next_target = None, np.inf, target
     for a, (Q, Qsa) in per_action.items():
         dists = np.abs(Qsa - target).sum(axis=1)
         i = int(np.argmin(dists))
@@ -106,67 +153,131 @@ def _pick_action_cached(cache, state_flat, target):
             best_dist = float(dists[i])
             best_action = a
             next_target = Q[i]
-
     if best_action is None:
         return 0, target, False
     return best_action, next_target, True
 
 
-def _rollout_qtable(cache, env, target_vec, n_obj, env_shape, action_nvec):
-    """Target-track one policy through one scenario. Returns the per-objective
-    summed reward (MAX-form, i.e. the env's native reward sign).
-    """
+def _rollout(cache, env, target_vec, n_obj, env_shape, action_nvec):
+    """One target-tracked rollout. Returns (total_reward, feasible).
+    `feasible` reflects info['feasible'] at the LAST step of the
+    episode — which by construction equals `_n_violations_*` == 0
+    over the whole episode (the env accumulates and `reset()` zeros
+    them, per the canonical contract)."""
     obs, _ = env.reset()
     target = np.array(target_vec, dtype=float)
     total = np.zeros(n_obj, dtype=np.float64)
-
+    feasible = True
     for _ in range(env.n_gym_steps):
         state_flat = int(np.ravel_multi_index(obs, env_shape))
-        best_action, next_target, _ = _pick_action_cached(
+        action_flat, next_target, _ = _pick_action_cached(
             cache, state_flat, target)
-        action_nd = np.unravel_index(best_action, action_nvec)
-        obs, reward, terminated, truncated, _ = env.step(
+        action_nd = np.unravel_index(action_flat, action_nvec)
+        obs, reward, terminated, truncated, info = env.step(
             np.array(action_nd, dtype=np.int64))
         total += np.asarray(reward, dtype=np.float64)
+        feasible = bool(info.get('feasible', True))
         target = next_target
         if terminated or truncated:
             break
+    return total, feasible
 
-    return total
 
+# ----------------------------------------------------------------------
+# Per-agent evaluation
+# ----------------------------------------------------------------------
+def _evaluate_agent(agent, scenarios, n_obj):
+    """Re-evaluate one MORL agent against the eval scenarios. Drops any
+    policy that violates the constraint in ANY scenario (the env's
+    info['feasible'] flag turns False at episode end if any year of any
+    step exceeded Pcrit). Short-circuits per policy: stops at the first
+    violating scenario.
 
-def _action_sequence(cache, env, target_vec, env_shape, action_nvec):
-    """The action sequence a policy takes — used by the diagnostic to count
-    how many distinct executable policies an archive actually yields.
-    Run on the env as-is (its own inflow seed); deterministic given target.
+    Returns (targets_feas, means_feas, diag).
+      targets_feas : (n_feas, n_obj) archive target vectors (MAX-conv)
+      means_feas   : (n_feas, n_obj) mean realised reward across scenarios
+                     (MAX-conv) — for feasible policies only
+      diag         = {n_archive_orig, n_archive (post-subsample),
+                      n_feasible, n_infeasible, mean_corr}
     """
-    obs, _ = env.reset()
-    target = np.array(target_vec, dtype=float)
-    actions = []
-    for _ in range(env.n_gym_steps):
-        state_flat = int(np.ravel_multi_index(obs, env_shape))
-        best_action, next_target, _ = _pick_action_cached(
-            cache, state_flat, target)
-        actions.append(best_action)
-        action_nd = np.unravel_index(best_action, action_nvec)
-        obs, _, terminated, truncated, _ = env.step(
-            np.array(action_nd, dtype=np.int64))
-        target = next_target
-        if terminated or truncated:
-            break
-    return tuple(actions)
+    decomp = (agent.action_eval == 'decomposition')
+    cache = _build_q_cache(agent, decomp)
+    env_shape = tuple(int(x) for x in agent.env_shape)
+    env_shape_arr = np.array(env_shape)
+    action_nvec = tuple(int(x) for x in agent.env.action_space.nvec)
+
+    raw_archive = list(agent.archive)
+    n_archive_orig = len(raw_archive)
+    if not raw_archive:
+        return (np.empty((0, n_obj)), np.empty((0, n_obj)),
+                {'n_archive': 0, 'n_archive_orig': 0,
+                 'n_feasible': 0, 'n_infeasible': 0,
+                 'mean_corr': float('nan')})
+
+    if (MAX_POLICIES_PER_AGENT is not None and
+            n_archive_orig > MAX_POLICIES_PER_AGENT):
+        kept = agent._subsample_nd(set(agent.archive),
+                                   target_size=MAX_POLICIES_PER_AGENT)
+        raw_archive = list(kept)
+    archive = [np.asarray(v, dtype=float) for v in raw_archive]
+
+    envs = [_build_env(s, n_obj) for s in scenarios]
+    n_scen = len(envs)
+
+    targets_feas, means_feas = [], []
+    n_infeasible = 0
+    for target_vec in archive:
+        sums = np.zeros(n_obj, dtype=np.float64)
+        feasible = True
+        for env in envs:
+            ret, feas = _rollout(
+                cache, env, target_vec, n_obj, env_shape_arr, action_nvec)
+            if not feas:
+                feasible = False
+                break             # short-circuit: any infeasible scenario → drop
+            sums += ret
+        if feasible:
+            targets_feas.append(target_vec)
+            means_feas.append(sums / n_scen)
+        else:
+            n_infeasible += 1
+
+    if not targets_feas:
+        return (np.empty((0, n_obj)), np.empty((0, n_obj)),
+                {'n_archive': len(archive),
+                 'n_archive_orig': n_archive_orig,
+                 'n_feasible': 0,
+                 'n_infeasible': n_infeasible,
+                 'mean_corr': float('nan')})
+
+    targets   = np.vstack([t.reshape(1, -1) for t in targets_feas])
+    means_pos = np.vstack([m.reshape(1, -1) for m in means_feas])
+
+    corrs = []
+    for j in range(n_obj):
+        if (np.std(targets[:, j]) > 1e-9 and
+                np.std(means_pos[:, j]) > 1e-9):
+            corrs.append(
+                np.corrcoef(targets[:, j], means_pos[:, j])[0, 1])
+    mean_corr = float(np.nanmean(corrs)) if corrs else float('nan')
+
+    return targets, means_pos, {
+        'n_archive': len(archive),
+        'n_archive_orig': n_archive_orig,
+        'n_feasible': len(targets_feas),
+        'n_infeasible': n_infeasible,
+        'mean_corr': mean_corr}
 
 
-# ── Non-domination filter (minimization form) ─────────────────────────────────
-def _is_nondominated(values):
-    """Boolean mask of non-dominated rows under MINIMISATION (matches the
-    negated-reward convention shared with the MOEA archives).
-    """
+# ----------------------------------------------------------------------
+# ND filter (MIN-conv input)
+# ----------------------------------------------------------------------
+def _nd_filter_min(values):
     arr = np.asarray(values, dtype=float)
     if arr.shape[0] <= 1:
         return np.ones(arr.shape[0], dtype=bool)
-    if _moocore_is_nd is not None:
-        return _moocore_is_nd(arr)
+    if _moo_is_nd is not None:
+        return _moo_is_nd(arr)
     n = arr.shape[0]
     keep = np.ones(n, dtype=bool)
     for i in range(n):
@@ -181,357 +292,426 @@ def _is_nondominated(values):
     return keep
 
 
-# ── Agent loading ─────────────────────────────────────────────────────────────
-def _load_agent(agent_path, n_obj):
-    """Construct a PQL agent and restore its Q-table.
+# ----------------------------------------------------------------------
+# HV machinery — IDENTICAL to constrained_lake_moea_reeval.py.
+# Box loaded from params_config.lake_box_* (same constants as the
+# unconstrained two-lake problem). This is valid because feasibility
+# filtering above drops every policy with any penalty contribution —
+# the surviving feasible policies' realised o* values fall in the same
+# range as the unconstrained problem.
+# ----------------------------------------------------------------------
+from moocore import hypervolume as _exact_hv
 
-    gzip-aware: the current pql.py writes gzip-compressed payloads; older
-    plain-pickle payloads still load. PQL.load_q_table itself also handles
-    both — we only peek here to size the constructor (n_scenarios) for a
-    robust agent.
-    """
-    with open(agent_path, 'rb') as f:
-        magic = f.read(2)
-    opener = gzip.open if magic == b'\x1f\x8b' else open
-    with opener(agent_path, 'rb') as f:
-        payload = pickle.load(f)
-    cfg = payload['config']
-    saved_robust = bool(cfg.get('robust', False))
-    n_scenarios = payload.get('n_scenarios', None) if saved_robust else None
-
-    env = TwoLakeEnv(num_obj=n_obj)
-    kwargs = dict(env=env, ref_point=np.array(cfg['ref_point']))
-    if saved_robust and n_scenarios is not None:
-        kwargs['robust'] = True
-        kwargs['n_scenarios'] = n_scenarios
-    agent = PQL(**kwargs)
-    agent.load_q_table(agent_path)
-    return agent
+MC_SAMPLES_6OBJ = 50_000
+MC_SEED = 12345
 
 
-def build_env(scenario, n_obj):
-    """Build a constrained TwoLakeEnv for one evaluation scenario."""
-    return TwoLakeEnv(
-        b1=float(scenario['b1']),
-        q1=float(scenario['q1']),
-        b2=float(scenario['b2']),
-        q2=float(scenario['q2']),
-        inflow_seed1=int(scenario['inflow_seed1']),
-        inflow_seed2=int(scenario['inflow_seed2']),
-        Pcrit1=float(scenario['Pcrit1']),
-        Pcrit2=float(scenario['Pcrit2']),
-        num_obj=n_obj,
-    )
+def _hv_exact(front_max, ref_min):
+    if len(front_max) == 0:
+        return 0.0
+    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
 
 
-# ── Cell spec + per-cell evaluation ───────────────────────────────────────────
-@dataclass
-class CellSpec:
-    folder_path: str
-    scoring: str
-    method: str
-    n_obj: int
-    agent_files: List[Tuple[str, Optional[int]]] = field(default_factory=list)
-    agent_stem: Optional[str] = None
-    agent_nfe: Optional[str] = None
+def _hv_mc(front_max, lo, hi, samples):
+    if len(front_max) == 0:
+        return 0.0
+    F = np.ascontiguousarray(front_max, float)
+    N = samples.shape[0]
+    dom = np.zeros(N, dtype=bool)
+    blk = 2000
+    for i in range(0, N, blk):
+        S = samples[i:i + blk]
+        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
+    return float(dom.mean() * np.prod(hi - lo))
 
 
-def _eval_one_policy_batch(args):
-    """Process-pool worker: evaluate a batch of target vectors across all
-    scenarios. Envs are rebuilt inside the worker from plain scenario dicts.
-    """
-    (target_vecs, scenarios_data, n_obj, env_shape_tuple,
-     action_nvec, cache) = args
-
-    envs = [
-        TwoLakeEnv(
-            b1=s['b1'], q1=s['q1'], b2=s['b2'], q2=s['q2'],
-            inflow_seed1=s['inflow_seed1'], inflow_seed2=s['inflow_seed2'],
-            Pcrit1=s['Pcrit1'], Pcrit2=s['Pcrit2'], num_obj=n_obj,
-        )
-        for s in scenarios_data
-    ]
-    env_shape = np.array(env_shape_tuple)
-
-    results = []
-    for target_vec in target_vecs:
-        scenario_returns = np.zeros((len(envs), n_obj), dtype=np.float64)
-        for s_idx, env in enumerate(envs):
-            scenario_returns[s_idx] = _rollout_qtable(
-                cache, env, target_vec, n_obj, env_shape, action_nvec)
-        results.append((scenario_returns.mean(axis=0),
-                        tuple(float(t) for t in target_vec)))
-    return results
+def _fixed_box(n_obj):
+    if SETTING == 'deterministic':
+        from params_config import (lake_box_deterministic_dim2,
+                                   lake_box_deterministic_dim6)
+        box = {2: lake_box_deterministic_dim2,
+               6: lake_box_deterministic_dim6}[n_obj]
+    else:
+        from params_config import (lake_box_robust_dim2,
+                                   lake_box_robust_dim6)
+        box = {2: lake_box_robust_dim2,
+               6: lake_box_robust_dim6}[n_obj]
+    nadir = np.asarray(box['nadir'], dtype=float)
+    ideal = np.asarray(box['ideal'], dtype=float)
+    if not np.all(ideal > nadir):
+        raise ValueError(f'Degenerate box for lake dim={n_obj}')
+    return nadir, ideal
 
 
-def evaluate_cell(spec, eval_scenarios, policy_workers=1):
-    t0 = time.monotonic()
+def _panel_machinery(cells, n_obj):
+    nadir, ideal = _fixed_box(n_obj)
+    box_volume = float(np.prod(ideal - nadir))
+    if n_obj == 2:
+        ref_min = -nadir
+        hv = lambda F: _hv_exact(np.clip(F, nadir, ideal), ref_min)
+        meta = dict(estimator='exact')
+    else:
+        rng = np.random.default_rng(MC_SEED)
+        samples = rng.uniform(nadir, ideal, size=(MC_SAMPLES_6OBJ, n_obj))
+        hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
+        meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
+                    mc_seed=MC_SEED)
+    union = np.vstack([c[4] for c in cells])
+    best_known_hv = hv(union)
+    meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
+                box_volume=box_volume, best_known_hv=best_known_hv,
+                n_union_points=int(len(union)))
+    return hv, box_volume, meta
 
-    scenarios_data = [
-        {
-            'b1': float(s['b1']), 'q1': float(s['q1']),
-            'b2': float(s['b2']), 'q2': float(s['q2']),
-            'inflow_seed1': int(s['inflow_seed1']),
-            'inflow_seed2': int(s['inflow_seed2']),
-            'Pcrit1': float(s['Pcrit1']), 'Pcrit2': float(s['Pcrit2']),
-        }
-        for s in eval_scenarios
-    ]
 
-    all_records = []
+# ----------------------------------------------------------------------
+# Worker: re-evaluate one (config, seed) cell
+# ----------------------------------------------------------------------
+def _process_one_cell(task):
+    sd_dir        = task['sd_dir']
+    k             = task['seed']
+    scoring       = task['scoring']
+    scenm         = task['scenm']
+    n_obj         = task['n_obj']
+    out_csv_seed  = task['out_csv_seed']
+    meta          = task['meta']
+    scenarios     = _EVAL_SCENARIOS
+
+    t0 = time.time()
+    agent_files = []
+    for fname in sorted(os.listdir(sd_dir)):
+        am = AGENT_RE.match(fname)
+        if not am:
+            continue
+        _nfe, ref_num = am.groups()
+        ref_num = int(ref_num) if ref_num is not None else None
+        agent_files.append((os.path.join(sd_dir, fname), ref_num))
+    if not agent_files:
+        return {**meta, 'seed': k, 'front_min': None,
+                'rows': None, 'dt': time.time() - t0,
+                'note': 'no agent files'}
+
+    all_targets, all_means, all_ref = [], [], []
     diag_lines = []
+    n_evaluated_cell  = 0   # sum of policies actually rolled out (post-subsample)
+    n_infeasible_cell = 0   # sum of infeasible policies dropped
+    for fpath, ref_num in agent_files:
+        agent = _load_agent(fpath, n_obj=n_obj)
+        if int(agent.num_objectives) != n_obj:
+            raise ValueError(
+                f'{os.path.basename(fpath)}: num_objectives '
+                f'{agent.num_objectives} != folder n_obj {n_obj}')
+        targets, means_pos, diag = _evaluate_agent(
+            agent, scenarios, n_obj)
 
-    for fpath, ref_num in spec.agent_files:
-        agent = _load_agent(fpath, n_obj=spec.n_obj)
-        decomp = (agent.action_eval == 'decomposition')
-        cache = _build_q_cache(agent, decomp)
-        env_shape = tuple(int(x) for x in agent.env_shape)
-        action_nvec = tuple(int(x) for x in agent.env.action_space.nvec)
+        n_evaluated_cell  += diag['n_archive']
+        n_infeasible_cell += diag['n_infeasible']
 
-        archive = list(agent.archive)
-        if not archive:
-            continue
-
-        if (MAX_POLICIES_PER_AGENT is not None
-                and len(archive) > MAX_POLICIES_PER_AGENT):
-            n_before_sub = len(archive)
-            kept = agent._subsample_nd(set(archive),
-                                       target_size=MAX_POLICIES_PER_AGENT)
-            archive = list(kept)
-            print(f'    [{os.path.basename(spec.folder_path)} ref={ref_num}] '
-                  f'subsampled archive: {n_before_sub} -> {len(archive)}',
-                  flush=True)
-
-        # DIAGNOSTIC: unique executable policies + target-realised correlation.
-        # Uses a single env (the agent's own constructor defaults) for the
-        # action-sequence count, and the full evaluation means for the
-        # correlation — computed below once means are in hand.
-        diag_env = agent.env
-        env_shape_arr = np.array(env_shape)
-        seqs = set()
-        for target_vec in archive:
-            seqs.add(_action_sequence(cache, diag_env, target_vec,
-                                      env_shape_arr, action_nvec))
-
-        # Sequential rollouts (policy_workers <= 1) or process-pool batches.
-        agent_targets, agent_means = [], []
-        if policy_workers <= 1:
-            envs = [build_env(eval_scenarios[s], spec.n_obj)
-                    for s in range(len(eval_scenarios))]
-            for target_vec in archive:
-                scenario_returns = np.zeros((len(envs), spec.n_obj),
-                                            dtype=np.float64)
-                for s_idx, env in enumerate(envs):
-                    scenario_returns[s_idx] = _rollout_qtable(
-                        cache, env, target_vec, spec.n_obj,
-                        env_shape_arr, action_nvec)
-                mean_pos = scenario_returns.mean(axis=0)
-                agent_targets.append(tuple(float(t) for t in target_vec))
-                agent_means.append(mean_pos)
-        else:
-            batch_size = max(1, len(archive) // (policy_workers * 4))
-            batches = [archive[i:i + batch_size]
-                       for i in range(0, len(archive), batch_size)]
-            args_list = [
-                (batch, scenarios_data, spec.n_obj, env_shape,
-                 action_nvec, cache)
-                for batch in batches
-            ]
-            with ProcessPoolExecutor(max_workers=policy_workers) as pool:
-                for results in pool.map(_eval_one_policy_batch, args_list):
-                    for mean_pos, tgt_tuple in results:
-                        agent_targets.append(tgt_tuple)
-                        agent_means.append(mean_pos)
-
-        for tgt_tuple, mean_pos in zip(agent_targets, agent_means):
-            all_records.append({
-                'agent_ref': ref_num if ref_num is not None else -1,
-                'target_vec': tgt_tuple,
-                'mean_pos': mean_pos,
-            })
-
-        # target-realised correlation, averaged over objectives
-        tgt_arr = np.array(agent_targets, dtype=float)
-        mean_arr = np.array(agent_means, dtype=float)
-        corrs = []
-        for j in range(spec.n_obj):
-            if (np.std(tgt_arr[:, j]) > 1e-9
-                    and np.std(mean_arr[:, j]) > 1e-9):
-                corrs.append(np.corrcoef(tgt_arr[:, j], mean_arr[:, j])[0, 1])
-        mean_corr = float(np.nanmean(corrs)) if corrs else float('nan')
         ref_tag = f' ref{ref_num}' if ref_num is not None else ''
-        corr_str = 'nan' if np.isnan(mean_corr) else f'{mean_corr:.2f}'
-        diag_lines.append(
-            f'    [diag {os.path.basename(spec.folder_path)}{ref_tag}] '
-            f'{len(seqs)}/{len(archive)} unique policies, '
-            f'target-realised corr={corr_str}')
+        corr_str = ('nan' if np.isnan(diag['mean_corr'])
+                    else f"{diag['mean_corr']:.2f}")
+        if diag['n_archive_orig'] != diag['n_archive']:
+            n_str = f"{diag['n_archive_orig']}→{diag['n_archive']} pols"
+        else:
+            n_str = f"{diag['n_archive']} pols"
+        infeas_str = (f", infeas={diag['n_infeasible']}"
+                      if diag['n_infeasible'] else '')
+        diag_lines.append(f"{ref_tag} {n_str}, corr={corr_str}{infeas_str}")
 
-    for line in diag_lines:
-        print(line, flush=True)
+        if len(targets) > 0:
+            all_targets.append(targets)
+            all_means.append(means_pos)
+            ref_id = ref_num if ref_num is not None else 0
+            all_ref.append(np.full(len(targets), ref_id, dtype=int))
 
-    if not all_records:
-        return {
-            'folder': os.path.basename(spec.folder_path),
-            'n_files': len(spec.agent_files),
-            'n_total': 0, 'n_nd': 0, 'n_dom': 0,
-            'out_name': None, 'elapsed_s': time.monotonic() - t0,
-        }
+    # If every policy was infeasible, write an empty CSV + sidecar so
+    # checkpointing still treats this cell as done. Front is empty
+    # (HV = 0 on the union).
+    if not all_targets:
+        os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
+        cols = ({'policy_id': [], 'agent_ref': []} |
+                {f'target_o{j+1}': [] for j in range(n_obj)} |
+                {f're_o{j+1}': [] for j in range(n_obj)})
+        pd.DataFrame(cols).to_csv(out_csv_seed, index=False)
+        side = out_csv_seed.replace('.csv', '_meta.json')
+        with open(side, 'w') as f:
+            json.dump({'n_evaluated': n_evaluated_cell,
+                       'n_infeasible': n_infeasible_cell}, f)
+        return {**meta, 'seed': k,
+                'front_min': np.empty((0, n_obj)),
+                'rows': 0,
+                'n_agents': len(agent_files),
+                'n_total_pol': 0,
+                'n_dom': 0,
+                'n_evaluated': n_evaluated_cell,
+                'n_infeasible': n_infeasible_cell,
+                'dt': time.time() - t0,
+                'diag': '; '.join(diag_lines),
+                'note': 'computed (all infeasible)'}
 
-    n_total = len(all_records)
+    targets   = np.vstack(all_targets)
+    means_pos = np.vstack(all_means)
+    agent_ref = np.concatenate(all_ref)
+    means_min = -means_pos
 
-    # MIN-form for the Pareto filter and output.
-    means_min = np.array([-r['mean_pos'] for r in all_records])
-    nd_mask = _is_nondominated(means_min)
-    n_dom = int((~nd_mask).sum())
+    keep = _nd_filter_min(means_min)
+    targets_k   = targets[keep]
+    means_min_k = means_min[keep]
+    ref_k       = agent_ref[keep]
 
-    rows = []
-    for keep, rec in zip(nd_mask, all_records):
-        if not keep:
-            continue
-        row = {}
-        if spec.method == 'multi':
-            row['agent_ref'] = rec['agent_ref']
-        for j in range(spec.n_obj):
-            row[f'target_o{j + 1}'] = rec['target_vec'][j]
-        for j in range(spec.n_obj):
-            row[f'o{j + 1}_mean'] = -rec['mean_pos'][j]
-        rows.append(row)
+    out = {'policy_id': np.arange(int(keep.sum())),
+           'agent_ref': ref_k}
+    for j in range(n_obj):
+        out[f'target_o{j+1}'] = targets_k[:, j]
+    for j in range(n_obj):
+        out[f're_o{j+1}'] = means_min_k[:, j]
+    df_out = pd.DataFrame(out)
 
-    out = pd.DataFrame(rows)
-    out.insert(0, 'policy_id', np.arange(len(out)))
+    os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
+    df_out.to_csv(out_csv_seed, index=False)
 
-    out_name = f'archives_{spec.agent_stem}_{spec.agent_nfe}_evaluated.csv'
-    out.to_csv(os.path.join(spec.folder_path, out_name), index=False)
+    # Sidecar with per-cell feasibility counts (the per-seed CSV holds
+    # only feasible policies, so these counts would be lost otherwise).
+    side = out_csv_seed.replace('.csv', '_meta.json')
+    with open(side, 'w') as f:
+        json.dump({'n_evaluated': n_evaluated_cell,
+                   'n_infeasible': n_infeasible_cell}, f)
 
-    return {
-        'folder': os.path.basename(spec.folder_path),
-        'n_files': len(spec.agent_files),
-        'n_total': n_total, 'n_nd': len(out), 'n_dom': n_dom,
-        'out_name': out_name, 'elapsed_s': time.monotonic() - t0,
-    }
-
-
-def _cell_worker(args):
-    spec, eval_scenarios, policy_workers = args
-    try:
-        return evaluate_cell(spec, eval_scenarios,
-                             policy_workers=policy_workers)
-    except Exception:
-        return {
-            'folder': os.path.basename(spec.folder_path),
-            'error': traceback.format_exc(),
-        }
+    return {**meta, 'seed': k,
+            'front_min': means_min_k,
+            'rows': len(df_out),
+            'n_agents': len(agent_files),
+            'n_total_pol': len(means_min),
+            'n_dom': int((~keep).sum()),
+            'n_evaluated': n_evaluated_cell,
+            'n_infeasible': n_infeasible_cell,
+            'dt': time.time() - t0,
+            'diag': '; '.join(diag_lines),
+            'note': 'computed'}
 
 
-# ── Cell discovery + walker ───────────────────────────────────────────────────
-def discover_cells(base):
-    cells = []
-    for d in sorted(os.listdir(base)):
+# ----------------------------------------------------------------------
+# Discovery + task planning
+# ----------------------------------------------------------------------
+def _seed_idx(p):
+    m = re.search(r'seed(\d+)', p)
+    return int(m.group(1)) if m else -1
+
+
+def _enabled_stems():
+    """yield (scoring, scenm, n_obj, stem_dir) — mirrors lake_morl_reeval.py."""
+    morl_base = os.path.join(INPUT_ROOT, SETTING, 'morl')
+    if not os.path.isdir(morl_base):
+        return
+    allowed_scenms = set(run_scenario_method_for_setting[SETTING])
+    for d in sorted(os.listdir(morl_base)):
         m = FOLDER_RE.match(d)
         if not m:
             continue
-        scoring, method, n_obj, _seed = m.groups()
-        n_obj = int(n_obj)
-        folder_path = os.path.join(base, d)
-        if not os.path.isdir(folder_path):
-            continue
+        scoring, scenm, n_obj_s = m.groups()
+        n_obj = int(n_obj_s)
+        if scenm not in allowed_scenms: continue
+        if not run_scoring.get(scoring, 0): continue
+        if not run_n_obj.get(n_obj, 0): continue
+        yield scoring, scenm, n_obj, os.path.join(morl_base, d)
 
-        agent_files = []
-        agent_stem = None
-        agent_nfe = None
-        for fname in sorted(os.listdir(folder_path)):
-            am = AGENT_RE.match(fname)
-            if not am:
+
+def _build_tasks(reeval_root):
+    """Walk <setting>/morl/<stem>/seed*, build per-cell task dicts."""
+    tasks = []
+    prebuilt_cells = []
+    skipped = 0
+
+    for scoring, scenm, n_obj, stem_dir in _enabled_stems():
+        stem_name = os.path.basename(stem_dir)
+        for sd in sorted(os.listdir(stem_dir)):
+            sd_dir = os.path.join(stem_dir, sd)
+            if not os.path.isdir(sd_dir):
                 continue
-            stem, nfe, ref_num = am.groups()
-            ref_num = int(ref_num) if ref_num is not None else None
-            agent_files.append((os.path.join(folder_path, fname), ref_num))
-            agent_stem = stem
-            agent_nfe = nfe
+            k = _seed_idx(sd_dir)
+            if k < 0:
+                continue
+            out_csv_seed = os.path.join(reeval_root, stem_name, f'seed{k}.csv')
 
-        if not agent_files:
-            continue
+            if os.path.exists(out_csv_seed):
+                prev = pd.read_csv(out_csv_seed)
+                re_cols = [c for c in prev.columns
+                           if re.fullmatch(r're_o\d+', c)]
+                if re_cols:
+                    F_min = prev[re_cols].values
+                    # Recover infeasible count from sidecar; absent → 0
+                    # (legacy CSVs without sidecar are treated as
+                    # "no infeasible info recorded").
+                    side = out_csv_seed.replace('.csv', '_meta.json')
+                    n_eval = 0
+                    n_infeas = 0
+                    if os.path.exists(side):
+                        try:
+                            with open(side) as f:
+                                sd_meta = json.load(f)
+                            n_eval   = int(sd_meta.get('n_evaluated', 0))
+                            n_infeas = int(sd_meta.get('n_infeasible', 0))
+                        except Exception:
+                            pass
+                    prebuilt_cells.append(
+                        (scoring, scenm, n_obj, k, F_min, n_eval, n_infeas))
+                    skipped += 1
+                    continue
 
-        cells.append(CellSpec(
-            folder_path=folder_path, scoring=scoring, method=method,
-            n_obj=n_obj, agent_files=agent_files,
-            agent_stem=agent_stem, agent_nfe=agent_nfe,
-        ))
-    return cells
-
-
-def walk_and_evaluate(base, eval_scenarios_path, cell_workers=0,
-                      policy_workers=1, dry_run=False):
-    eval_scenarios = np.load(eval_scenarios_path)
-    print(f'Loaded {len(eval_scenarios)} evaluation scenarios '
-          f'from {eval_scenarios_path}')
-
-    cells = discover_cells(base)
-    print(f'Discovered {len(cells)} cells.')
-
-    if dry_run:
-        for spec in cells:
-            print(f'  [{spec.scoring}_{spec.method}_{spec.n_obj}] '
-                  f'{os.path.basename(spec.folder_path)} '
-                  f'- {len(spec.agent_files)} agent(s)')
-        return
-
-    n_workers = cell_workers or os.cpu_count() or 4
-    n_workers = min(n_workers, len(cells)) if cells else 1
-    print(f'Using {n_workers} cell worker(s), '
-          f'{policy_workers} policy worker(s) per cell.\n')
-
-    work_items = [(spec, eval_scenarios, policy_workers) for spec in cells]
-
-    t_start = time.monotonic()
-    n_done = 0
-    n_errors = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_cell_worker, item): item[0]
-                   for item in work_items}
-        for fut in as_completed(futures):
-            result = fut.result()
-            n_done += 1
-            if 'error' in result:
-                n_errors += 1
-                print(f'  ERROR in {result["folder"]}:\n{result["error"]}',
-                      file=sys.stderr)
-            else:
-                r = result
-                print(f'  [{n_done:2d}/{len(cells)}] {r["folder"]}: '
-                      f'{r["n_files"]} agent(s), {r["n_total"]} policies -> '
-                      f'{r["n_nd"]} ND (-{r["n_dom"]} dom) | '
-                      f'{r["elapsed_s"]:.1f}s -> {r["out_name"]}')
-
-    elapsed = time.monotonic() - t_start
-    print(f'\nDone. {n_done - n_errors}/{len(cells)} cells written '
-          f'in {elapsed:.1f}s.')
+            tasks.append({
+                'sd_dir':    sd_dir,
+                'seed':      k,
+                'scoring':   scoring,
+                'scenm':     scenm,
+                'n_obj':     n_obj,
+                'out_csv_seed': out_csv_seed,
+                'meta': {'scoring': scoring, 'scenm': scenm, 'n_obj': n_obj},
+            })
+    return tasks, prebuilt_cells, skipped
 
 
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--base', default='../constrained_lake_data/robust/morl')
-    p.add_argument('--eval-scenarios',
-                   default='../lakes/lake_scenarios_eval.npy',
-                   dest='eval_scenarios')
-    p.add_argument('--workers', type=int, default=0,
-                   help='Cell-level worker processes (0 = os.cpu_count())')
-    p.add_argument('--policy-workers', type=int, default=1,
-                   dest='policy_workers',
-                   help='Process pool size within each cell for policy '
-                        'evaluation. Default 1 (sequential within cell).')
-    p.add_argument('--dry-run', action='store_true')
-    return p.parse_args()
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def _log_line(i, n_tasks, res):
+    label = f"{res['scoring']}_{res['scenm']}_{res['n_obj']}/seed{res['seed']}"
+    if res.get('note', '').startswith('computed'):
+        infeas_str = (f", {res['n_infeasible']} infeas"
+                      if res.get('n_infeasible', 0) else '')
+        print(f"   [{i:3d}/{n_tasks}] {label:42s} "
+              f"{res['dt']:6.1f}s  "
+              f"{res['n_agents']} agent(s), "
+              f"{res['n_total_pol']}→{res['rows']} pols "
+              f"({res['n_dom']} dom{infeas_str})  diag: {res['diag']}")
+    else:
+        print(f"   [{i:3d}/{n_tasks}] {label:42s}  {res['note']}")
 
 
 if __name__ == '__main__':
-    args = _parse_args()
-    walk_and_evaluate(
-        base=args.base,
-        eval_scenarios_path=args.eval_scenarios,
-        cell_workers=args.workers,
-        policy_workers=args.policy_workers,
-        dry_run=args.dry_run,
-    )
+    if SETTING == 'deterministic':
+        scenarios = _load_deterministic_morl_scenario()
+        print(f'SETTING=deterministic — using 1 scenario '
+              f'(default_lake_scenario)')
+    elif SETTING == 'robust':
+        scenarios = _load_robust_eval_scenarios(EVAL_SCENARIOS_PATH)
+        print(f'SETTING=robust — loaded {len(scenarios)} eval scenarios '
+              f'from {EVAL_SCENARIOS_PATH}')
+    else:
+        raise SystemExit(f'unknown SETTING {SETTING!r}')
+
+    out_root = os.path.join(OUTPUT_ROOT, SETTING, 'morl')
+    reeval_root = os.path.join(out_root, 'reeval_archives_morl')
+    os.makedirs(reeval_root, exist_ok=True)
+
+    tasks, prebuilt_cells, skipped = _build_tasks(reeval_root)
+    n_total = len(tasks) + skipped
+    n_workers = (os.cpu_count() if N_WORKERS == 0 else N_WORKERS) or 1
+    n_workers = min(n_workers, max(1, len(tasks)))
+
+    print(f'\n=== Re-evaluating MORL agents (constrained_lake, {SETTING}) ===')
+    print(f'   {n_total} cells total; {skipped} checkpointed, '
+          f'{len(tasks)} to compute with {n_workers} worker(s)')
+
+    cells = list(prebuilt_cells)
+    t0_all = time.time()
+    if tasks:
+        if n_workers == 1:
+            _worker_init(scenarios)
+            for i, task in enumerate(tasks, 1):
+                res = _process_one_cell(task)
+                if res.get('front_min') is not None:
+                    cells.append((res['scoring'], res['scenm'],
+                                  res['n_obj'], res['seed'],
+                                  res['front_min'],
+                                  res.get('n_evaluated', 0),
+                                  res.get('n_infeasible', 0)))
+                _log_line(i, len(tasks), res)
+        else:
+            with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=_worker_init,
+                    initargs=(scenarios,)) as pool:
+                futures = {pool.submit(_process_one_cell, t): t
+                           for t in tasks}
+                for i, fut in enumerate(as_completed(futures), 1):
+                    res = fut.result()
+                    if res.get('front_min') is not None:
+                        cells.append((res['scoring'], res['scenm'],
+                                      res['n_obj'], res['seed'],
+                                      res['front_min'],
+                                      res.get('n_evaluated', 0),
+                                      res.get('n_infeasible', 0)))
+                    _log_line(i, len(tasks), res)
+
+    print(f'\n   MORL re-evaluation done in {time.time() - t0_all:.1f}s')
+    print(f'   re-evaluated archives under {reeval_root}/')
+
+    if not cells:
+        raise SystemExit('no MORL cells available — nothing to score')
+
+    print('\n=== Computing HV on re-evaluated MORL fronts ===')
+    panel_cells_max = [(sc, scen, n, k, -F_min, ne, ni)
+                       for sc, scen, n, k, F_min, ne, ni in cells]
+    by_nobj = defaultdict(list)
+    for c in panel_cells_max:
+        by_nobj[c[2]].append(c)
+
+    rows = []
+    meta = {'setting': SETTING,
+            'kind': 'reevaluation_morl',
+            'problem': 'constrained_lake',
+            'n_eval_scenarios': len(scenarios),
+            'aggregation': 'arithmetic_mean_over_scenarios',
+            'multi_rule': 'pool_5_per_seed_target_tracked_then_nd_filter',
+            'feasibility_filter': ('drop policies with any violation in any '
+                                   'eval scenario (info["feasible"] == False)'),
+            'hv_box_source': ('params_config.lake_box_* — same constants as '
+                              'unconstrained two-lake (valid because feasible '
+                              'policies have zero penalty contribution)'),
+            'n_workers_used': n_workers,
+            'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'panels': {}}
+
+    for n_obj, pcells in sorted(by_nobj.items()):
+        # _panel_machinery only needs the front (5th tuple entry); pass through.
+        hv, box_volume, pmeta = _panel_machinery(pcells, n_obj)
+        # Per-panel infeasibility totals
+        panel_n_eval     = int(sum(c[5] for c in pcells))
+        panel_n_infeas   = int(sum(c[6] for c in pcells))
+        pmeta['n_evaluated_total']  = panel_n_eval
+        pmeta['n_infeasible_total'] = panel_n_infeas
+        meta['panels'][str(n_obj)]  = pmeta
+        print(f'\n n_obj={n_obj}: {len(pcells)} re-evaluated cells, '
+              f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
+              f"best-known HV={pmeta['best_known_hv']:.5g} "
+              f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
+        if panel_n_eval:
+            print(f'   infeasible: {panel_n_infeas}/{panel_n_eval} '
+                  f'({panel_n_infeas / panel_n_eval:.1%}) across cells')
+        for scoring, scenm, no, k, F, n_eval, n_infeas in pcells:
+            h = hv(F)
+            cond = f'closed_loop_{scenm}'
+            rows.append(dict(
+                paradigm='MORL', method=scoring, condition=cond,
+                scoring=scoring, scenario_method=scenm,
+                n_obj=no, seed=k, n_solutions=int(len(F)),
+                n_evaluated=int(n_eval), n_infeasible=int(n_infeas),
+                hv=h, box_volume=box_volume,
+                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
+        agg = defaultdict(list)
+        for r in rows:
+            if r['n_obj'] == n_obj:
+                agg[(r['method'], r['condition'])].append(r['hv_ratio'])
+        for (m, c), vs in sorted(agg.items()):
+            print(f'   {m:14s} {c:32s} n={len(vs):3d} '
+                  f'HVr={np.mean(vs):.4f}±{np.std(vs):.4f}')
+
+    df = pd.DataFrame(rows).sort_values(
+        ['n_obj', 'paradigm', 'method', 'condition', 'seed'])
+    out_csv  = os.path.join(out_root, 'metrics_long_reeval.csv')
+    out_json = os.path.join(out_root, '_meta_reeval.json')
+    df.to_csv(out_csv, index=False)
+    with open(out_json, 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'\n  wrote {out_csv}  ({len(df)} rows)')
+    print(f'  wrote {out_json}')

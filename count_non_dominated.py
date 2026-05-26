@@ -10,13 +10,12 @@ def is_nondominated(objectives: np.ndarray) -> np.ndarray:
     for i in range(n):
         if dominated[i]:
             continue
-        # Compare solution i against all others at once
-        diff = objectives - objectives[i]          # shape (n, n_obj)
-        # j dominates i  iff  all(diff[j] <= 0)  and  any(diff[j] < 0)
+
+        diff = objectives - objectives[i]  # shape (n, n_obj)
         all_ge = np.all(diff >= 0, axis=1)  # every objective >= i
         any_gt = np.any(diff > 0, axis=1)  # at least one strictly >
         dominators = all_ge & any_gt
-        dominators[i] = False                       # a solution can't dominate itself
+        dominators[i] = False  # a solution can't dominate itself
         if np.any(dominators):
             dominated[i] = True
 

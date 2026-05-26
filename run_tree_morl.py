@@ -62,12 +62,12 @@ num_weight_divisions = {
 
 # ── Objective metadata ────────────────────────────────────────────────────────
 ref_points = {
-    'multi_obj': np.full(tree_multi_obj, -1.0),  # was -10.0
-    'many_obj': np.full(tree_many_obj,  -1.0),  # was -10.0
+    'multi_obj': np.full(tree_multi_obj, -1.0),
+    'many_obj': np.full(tree_many_obj,  -1.0),
 }
 csv_paths = {
-    'multi_obj': f'./fruits/depth{tree_depth}_dim{tree_multi_obj}.csv',
-    'many_obj': f'./fruits/depth{tree_depth}_dim{tree_many_obj}.csv',
+    'multi_obj': f'./trees/depth{tree_depth}_dim{tree_multi_obj}.csv',
+    'many_obj': f'./trees/depth{tree_depth}_dim{tree_many_obj}.csv',
 }
 num_objectives = {
     'multi_obj': tree_multi_obj,
@@ -111,7 +111,7 @@ if __name__ == '__main__':
 
                     # ── Replication loop over random seeds ───────────
                     for seed in seeds:
-                        name = f'{base_name}_seed{seed}'
+                        name = f'{base_name}/seed{seed}'
                         print('--------------------------------------------------------------------')
                         print(f"This experiment is {name}, with depth={tree_depth}, num_obj={n_obj}")
                         print('--------------------------------------------------------------------')

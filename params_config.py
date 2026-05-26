@@ -10,9 +10,8 @@ seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 tree_depth = 9
 tree_multi_obj = 2
 tree_many_obj = 6
-slip_patterns_path = f'./fruits/slip_patterns_depth{tree_depth}.npy'
+slip_patterns_path = f'./trees/slip_patterns_depth{tree_depth}.npy'
 tree_n_scenarios = 50
-nd_size_cap_tree = 2 ** (tree_depth + 3)
 nd_update_freq_tree = 1
 archive_cap_tree = None
 gamma_tree = 1.0
@@ -22,10 +21,35 @@ total_years = 100
 years_per_action = 5
 lake_scenarios_path = './lakes/lake_scenarios.npy'
 lake_n_scenarios = 50
-nd_size_cap_lake = 128
+nd_size_cap_lake = 48
 nd_update_freq_lake = 1
 archive_cap_lake = None
 gamma_lake = 0.95
+
+tree_box_dim2 = {
+    'nadir': [0.0] * 2,
+    'ideal': [10.0] * 2,  # exact per-axis leaf maxes
+}
+tree_box_dim6 = {
+    'nadir': [0.0] * 6,
+    'ideal': [10.0] * 6,
+}
+lake_box_deterministic_dim2 = {
+    'nadir': [-3.0, 0.0],
+    'ideal': [0.0, 2.0],
+}
+lake_box_deterministic_dim6 = {
+    'nadir': [-3.0, -3.0, 0.0, 0.0, -1.0, -1.0],
+    'ideal': [0.0, 0.0, 2.0, 2.0, 0.0, 0.0],
+}
+lake_box_robust_dim2 = {
+    'nadir': [-5.0, 0.0],
+    'ideal': [0.0, 2.0],
+}
+lake_box_robust_dim6 = {
+    'nadir': [-5.0, -5.0, 0.0, 0.0, -1.0, -1.0],
+    'ideal': [0.0, 0.0, 2.0, 2.0, 0.0, 0.0],
+}
 
 multi_objs_tree_params = {
     'depth': tree_depth,
@@ -37,7 +61,7 @@ multi_objs_tree_params = {
     'constants': [
         Constant("depth", tree_depth),
         Constant("num_obj", tree_multi_obj),
-        Constant("csv_path", f"./fruits/depth{tree_depth}_dim{tree_multi_obj}.csv"),
+        Constant("csv_path", f"./trees/depth{tree_depth}_dim{tree_multi_obj}.csv"),
         Constant("observe", 1),
         Constant("slip_patterns_path", slip_patterns_path),
     ]
@@ -53,7 +77,7 @@ many_objs_tree_params = {
     'constants': [
         Constant("depth", tree_depth),
         Constant("num_obj", tree_many_obj),
-        Constant("csv_path", f"./fruits/depth{tree_depth}_dim{tree_many_obj}.csv"),
+        Constant("csv_path", f"./trees/depth{tree_depth}_dim{tree_many_obj}.csv"),
         Constant("observe", 1),
         Constant("slip_patterns_path", slip_patterns_path),
     ]
@@ -72,14 +96,14 @@ tree_reference_scenarios = [
 non_observable_constants_multi = [
     Constant("depth", tree_depth),
     Constant("num_obj", tree_multi_obj),
-    Constant("csv_path", f"./fruits/depth{tree_depth}_dim{tree_multi_obj}.csv"),
+    Constant("csv_path", f"./trees/depth{tree_depth}_dim{tree_multi_obj}.csv"),
     Constant("observe", 0),
 ]
 
 non_observable_constants_many = [
     Constant("depth", tree_depth),
     Constant("num_obj", tree_many_obj),
-    Constant("csv_path", f"./fruits/depth{tree_depth}_dim{tree_many_obj}.csv"),
+    Constant("csv_path", f"./trees/depth{tree_depth}_dim{tree_many_obj}.csv"),
     Constant("observe", 0),
 ]
 
@@ -88,10 +112,10 @@ non_observable_constants_many = [
 # ------------------------------------------------------------------
 multi_objs_lake_params = {
     'uncertainties': [
-        RealParameter('b1', 0.10, 0.45),
-        RealParameter('q1', 2.0, 4.5),
-        RealParameter('b2', 0.10, 0.45),
-        RealParameter('q2', 2.0, 4.5),
+        RealParameter('b1', 0.25, 0.45),
+        RealParameter('q1', 2.5, 4.5),
+        RealParameter('b2', 0.25, 0.45),
+        RealParameter('q2', 2.5, 4.5),
         IntegerParameter('inflow_seed1', 0, 10000),
         IntegerParameter('inflow_seed2', 0, 10000),
     ],
@@ -110,10 +134,10 @@ multi_objs_lake_params = {
 
 many_objs_lake_params = {
     'uncertainties': [
-        RealParameter('b1', 0.10, 0.45),
-        RealParameter('q1', 2.0, 4.5),
-        RealParameter('b2', 0.10, 0.45),
-        RealParameter('q2', 2.0, 4.5),
+        RealParameter('b1', 0.25, 0.45),
+        RealParameter('q1', 2.5, 4.5),
+        RealParameter('b2', 0.25, 0.45),
+        RealParameter('q2', 2.5, 4.5),
         IntegerParameter('inflow_seed1', 0, 10000),
         IntegerParameter('inflow_seed2', 0, 10000),
     ],
@@ -131,35 +155,35 @@ many_objs_lake_params = {
 }
 
 default_lake_scenario = {
-    'b1': 0.42, 'q1': 2.0,
-    'b2': 0.35, 'q2': 2.5,
+    'b1': 0.42, 'q1': 2.5,
+    'b2': 0.35, 'q2': 3.0,
     'inflow_seed1': 0,
     'inflow_seed2': 0,
-    'Pcrit1': _pcrit(0.42, 2.0),
-    'Pcrit2': _pcrit(0.35, 2.5)
+    'Pcrit1': _pcrit(0.42, 2.5),
+    'Pcrit2': _pcrit(0.35, 3.0)
 }
 
 lake_reference_scenarios = [
-    {'b1': 0.281, 'q1': 3.368,
-     'b2': 0.109, 'q2': 2.759,
-     'inflow_seed1': 4783, 'inflow_seed2': 3259,
-     'Pcrit1': _pcrit(0.281, 3.368),
-     'Pcrit2': _pcrit(0.109, 2.759)},
-    {'b1': 0.101, 'q1': 2.057,
-     'b2': 0.229, 'q2': 3.198,
-     'inflow_seed1': 9593, 'inflow_seed2': 6799,
-     'Pcrit1': _pcrit(0.101, 2.057),
-     'Pcrit2': _pcrit(0.229, 3.198)},
-    {'b1': 0.180, 'q1': 3.253,
-     'b2': 0.106, 'q2': 2.027,
-     'inflow_seed1': 7326, 'inflow_seed2': 7581,
-     'Pcrit1': _pcrit(0.180, 3.253),
-     'Pcrit2': _pcrit(0.106, 2.027)},
-    {'b1': 0.221, 'q1': 4.178,
-     'b2': 0.395, 'q2': 2.106,
-     'inflow_seed1': 895, 'inflow_seed2': 5197,
-     'Pcrit1': _pcrit(0.221, 4.178),
-     'Pcrit2': _pcrit(0.395, 2.106)},
+    {'b1': 0.443, 'q1': 2.554,
+     'b2': 0.252, 'q2': 2.823,
+     'inflow_seed1': 1284, 'inflow_seed2': 1357,
+     'Pcrit1': _pcrit(0.443, 2.554),
+     'Pcrit2': _pcrit(0.252, 2.823)},
+    {'b1': 0.252, 'q1': 2.544,
+     'b2': 0.427, 'q2': 2.651,
+     'inflow_seed1': 6900, 'inflow_seed2': 8408,
+     'Pcrit1': _pcrit(0.252, 2.544),
+     'Pcrit2': _pcrit(0.427, 2.651)},
+    {'b1': 0.340, 'q1': 3.513,
+     'b2': 0.361, 'q2': 3.415,
+     'inflow_seed1': 2903, 'inflow_seed2': 6424,
+     'Pcrit1': _pcrit(0.340, 3.513),
+     'Pcrit2': _pcrit(0.361, 3.415)},
+    {'b1': 0.258, 'q1': 2.712,
+     'b2': 0.260, 'q2': 2.629,
+     'inflow_seed1': 9443, 'inflow_seed2': 9837,
+     'Pcrit1': _pcrit(0.258, 2.712),
+     'Pcrit2': _pcrit(0.260, 2.629)},
 ]
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -168,10 +192,10 @@ lake_reference_scenarios = [
 
 constrained_multi_objs_lake_params = {
     'uncertainties': [
-        RealParameter('b1', 0.10, 0.45),
-        RealParameter('q1', 2.0, 4.5),
-        RealParameter('b2', 0.10, 0.45),
-        RealParameter('q2', 2.0, 4.5),
+        RealParameter('b1', 0.25, 0.45),
+        RealParameter('q1', 2.5, 4.5),
+        RealParameter('b2', 0.25, 0.45),
+        RealParameter('q2', 2.5, 4.5),
         IntegerParameter('inflow_seed1', 0, 10000),
         IntegerParameter('inflow_seed2', 0, 10000),
     ],
@@ -179,8 +203,6 @@ constrained_multi_objs_lake_params = {
     'outcomes': [
         ScalarOutcome(f'o{i + 1}', kind=ScalarOutcome.MINIMIZE)
         for i in range(lake_multi_obj)
-    ] + [
-        ScalarOutcome('n_violations_1', kind=ScalarOutcome.INFO),
     ],
 
     'constants': [
@@ -192,14 +214,13 @@ constrained_multi_objs_lake_params = {
     ]
 }
 
-# 6-obj MOEA model params. Adds n_violations_2 (lake 2 violation count)
-# as a second constraint outcome.
+# 6-obj MOEA model params.
 constrained_many_objs_lake_params = {
     'uncertainties': [
-        RealParameter('b1', 0.10, 0.45),
-        RealParameter('q1', 2.0, 4.5),
-        RealParameter('b2', 0.10, 0.45),
-        RealParameter('q2', 2.0, 4.5),
+        RealParameter('b1', 0.25, 0.45),
+        RealParameter('q1', 2.5, 4.5),
+        RealParameter('b2', 0.25, 0.45),
+        RealParameter('q2', 2.5, 4.5),
         IntegerParameter('inflow_seed1', 0, 10000),
         IntegerParameter('inflow_seed2', 0, 10000),
     ],
@@ -207,9 +228,6 @@ constrained_many_objs_lake_params = {
     'outcomes': [
         ScalarOutcome(f'o{i + 1}', kind=ScalarOutcome.MINIMIZE)
         for i in range(lake_many_obj)
-    ] + [
-        ScalarOutcome('n_violations_1', kind=ScalarOutcome.INFO),
-        ScalarOutcome('n_violations_2', kind=ScalarOutcome.INFO),
     ],
 
     'constants': [
@@ -222,24 +240,24 @@ constrained_many_objs_lake_params = {
 }
 
 constrained_lake_reference_scenarios = [
-    {'b1': 0.268, 'q1': 2.175,
-     'b2': 0.415, 'q2': 2.073,
-     'inflow_seed1': 9622, 'inflow_seed2': 1693,
-     'Pcrit1': _pcrit(0.268, 2.175),
-     'Pcrit2': _pcrit(0.415, 2.073)},
-    {'b1': 0.222, 'q1': 4.234,
-     'b2': 0.101, 'q2': 4.285,
-     'inflow_seed1': 451, 'inflow_seed2': 4569,
-     'Pcrit1': _pcrit(0.222, 4.234),
-     'Pcrit2': _pcrit(0.101, 4.285)},
-    {'b1': 0.223, 'q1': 2.245,
-     'b2': 0.132, 'q2': 3.018,
-     'inflow_seed1': 674, 'inflow_seed2': 1256,
-     'Pcrit1': _pcrit(0.223, 2.245),
-     'Pcrit2': _pcrit(0.132, 3.018)},
-    {'b1': 0.434, 'q1': 2.234,
-     'b2': 0.336, 'q2': 2.461,
-     'inflow_seed1': 5994, 'inflow_seed2': 2608,
-     'Pcrit1': _pcrit(0.434, 2.234),
-     'Pcrit2': _pcrit(0.336, 2.461)},
+    {'b1': 0.351, 'q1': 4.065,
+     'b2': 0.376, 'q2': 4.222,
+     'inflow_seed1': 1522, 'inflow_seed2': 2307,
+     'Pcrit1': _pcrit(0.351, 4.065),
+     'Pcrit2': _pcrit(0.376, 4.222)},
+    {'b1': 0.377, 'q1': 3.800,
+     'b2': 0.399, 'q2': 3.350,
+     'inflow_seed1': 8772, 'inflow_seed2': 955,
+     'Pcrit1': _pcrit(0.377, 3.800),
+     'Pcrit2': _pcrit(0.399, 3.350)},
+    {'b1': 0.250, 'q1': 4.338,
+     'b2': 0.375, 'q2': 3.314,
+     'inflow_seed1': 8282, 'inflow_seed2': 3230,
+     'Pcrit1': _pcrit(0.250, 4.338),
+     'Pcrit2': _pcrit(0.375, 3.314)},
+    {'b1': 0.396, 'q1': 2.807,
+     'b2': 0.275, 'q2': 4.132,
+     'inflow_seed1': 3329, 'inflow_seed2': 3111,
+     'Pcrit1': _pcrit(0.396, 2.807),
+     'Pcrit2': _pcrit(0.275, 4.132)},
 ]

@@ -1,10 +1,8 @@
 import os
 import numpy as np
 from scipy.optimize import brentq
-from params_config import (
-    multi_objs_lake_params,
-    lake_n_scenarios,
-)
+from params_config import lake_n_scenarios
+from scenario_selection import generate_scenarios
 
 SCENARIO_SEED = 42
 
@@ -14,10 +12,9 @@ def _solve_pcrit(b, q):
 
 
 def generate_lake_scenarios(n_scenarios=lake_n_scenarios, seed=SCENARIO_SEED):
+    """Latin-hypercube sample over the lake uncertainty space."""
     rng = np.random.default_rng(seed)
-
-    bounds = {u.name: (u.lower_bound, u.upper_bound)
-              for u in multi_objs_lake_params['uncertainties']}
+    df = generate_scenarios(n_scenarios, rng)
 
     dt = np.dtype([
         ('b1', np.float64), ('q1', np.float64),
@@ -26,37 +23,40 @@ def generate_lake_scenarios(n_scenarios=lake_n_scenarios, seed=SCENARIO_SEED):
         ('Pcrit1', np.float64), ('Pcrit2', np.float64),
     ])
     scenarios = np.empty(n_scenarios, dtype=dt)
-
-    scenarios['b1'] = rng.uniform(*bounds['b1'], n_scenarios)
-    scenarios['q1'] = rng.uniform(*bounds['q1'], n_scenarios)
-    scenarios['b2'] = rng.uniform(*bounds['b2'], n_scenarios)
-    scenarios['q2'] = rng.uniform(*bounds['q2'], n_scenarios)
-    scenarios['inflow_seed1'] = rng.integers(
-        bounds['inflow_seed1'][0], bounds['inflow_seed1'][1] + 1, n_scenarios)
-    scenarios['inflow_seed2'] = rng.integers(
-        bounds['inflow_seed2'][0], bounds['inflow_seed2'][1] + 1, n_scenarios)
-
-    # Pre-solve critical thresholds so MoroLakeEnv.reset doesn't have to
+    for c in ('b1', 'q1', 'b2', 'q2',
+              'inflow_seed1', 'inflow_seed2'):
+        scenarios[c] = df[c].to_numpy()
     for i in range(n_scenarios):
-        scenarios['Pcrit1'][i] = _solve_pcrit(scenarios['b1'][i], scenarios['q1'][i])
-        scenarios['Pcrit2'][i] = _solve_pcrit(scenarios['b2'][i], scenarios['q2'][i])
-
+        scenarios['Pcrit1'][i] = _solve_pcrit(
+            scenarios['b1'][i], scenarios['q1'][i])
+        scenarios['Pcrit2'][i] = _solve_pcrit(
+            scenarios['b2'][i], scenarios['q2'][i])
     return scenarios
 
 
-def main():
-    scenarios = generate_lake_scenarios(1000)
-
-    os.makedirs('lakes', exist_ok=True)
-    out_path = 'lakes/lake_scenarios_eval.npy'
-    np.save(out_path, scenarios)
-
+def _summarise(scenarios, indices, out_path):
     print(f"Generated {len(scenarios)} lake scenarios -> {out_path}")
-    for i in [0, 199, 399, 599, 799, 999]:
+    for i in indices:
         s = scenarios[i]
-        print(f"  scenario {i:2d}: b1={s['b1']:.3f}, q1={s['q1']:.3f}, "
+        print(f"  scenario {i:4d}: b1={s['b1']:.3f}, q1={s['q1']:.3f}, "
               f"b2={s['b2']:.3f}, q2={s['q2']:.3f}, "
               f"inflow_seeds=({s['inflow_seed1']},{s['inflow_seed2']})")
+
+
+def main():
+    os.makedirs('lakes', exist_ok=True)
+
+    # Training set
+    train = generate_lake_scenarios(lake_n_scenarios, seed=SCENARIO_SEED)
+    train_path = 'lakes/lake_scenarios.npy'
+    np.save(train_path, train)
+    _summarise(train, [0, len(train) // 2, len(train) - 1], train_path)
+
+    # Eval set — a separate seed so the two sets are independent draws.
+    eval_ = generate_lake_scenarios(1000, seed=SCENARIO_SEED + 1)
+    eval_path = 'lakes/lake_scenarios_eval.npy'
+    np.save(eval_path, eval_)
+    _summarise(eval_, [0, 199, 399, 599, 799, 999], eval_path)
 
 
 if __name__ == '__main__':

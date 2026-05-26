@@ -59,15 +59,16 @@ import pandas as pd
 from scipy.spatial.distance import pdist
 
 from two_lake import TwoLakeEnv
+from constrained_two_lake import ConstrainedTwoLakeEnv
 from params_config import total_years, years_per_action
 
 # ── Lake configuration ────────────────────────────────────────────────────────
 
 UNCERTAINTY_BOUNDS = {
-    "b1":           (0.10, 0.45),
-    "q1":           (2.0,  4.5),
-    "b2":           (0.10, 0.45),
-    "q2":           (2.0,  4.5),
+    "b1":           (0.25, 0.45),
+    "q1":           (2.5,  4.5),
+    "b2":           (0.25, 0.45),
+    "q2":           (2.5,  4.5),
     "inflow_seed1": (0,    10000),
     "inflow_seed2": (0,    10000),
 }
@@ -135,22 +136,17 @@ def _run_episode(env, action_seq, num_obj: int) -> np.ndarray:
 
 
 def run_experiments(policies: np.ndarray, scenarios_df: pd.DataFrame,
-                    num_obj: int) -> pd.DataFrame:
+                    num_obj: int, env_cls=TwoLakeEnv) -> pd.DataFrame:
     """Replay every policy under every scenario and return a long-form
     DataFrame: one row per (policy, scenario) experiment, columns are the
     deep-uncertainty values + outcome values (o1..oN) + indices.
-
-    Mirrors the original `perform_experiments(model, nr_experiments,
-    policies=policies)` call which produces an `(experiments, outcomes)` pair
-    where `experiments` has one row per (policy, scenario) and `outcomes` is
-    a dict of arrays of length n_pol*n_sc.
     """
     n_pol = policies.shape[0]
     n_sc = len(scenarios_df)
     rows = []
     for s_idx in range(n_sc):
         s = scenarios_df.iloc[s_idx]
-        env = TwoLakeEnv(
+        env = env_cls(
             b1=float(s["b1"]), q1=float(s["q1"]),
             b2=float(s["b2"]), q2=float(s["q2"]),
             inflow_seed1=int(s["inflow_seed1"]),
@@ -180,9 +176,6 @@ def run_experiments(policies: np.ndarray, scenarios_df: pd.DataFrame,
 def _undesired_half_mask(experiments, obj_cols, agg_func, min_undesired=None):
     """Return mask where at least `min_undesired` outcomes are in the
     undesired half. Defaults to ALL outcomes (matches the original).
-
-    With 6 anti-correlated objectives the strict 'all' filter often
-    retains zero experiments — see the comment in the run() function.
     """
     if min_undesired is None:
         min_undesired = len(obj_cols)
@@ -208,10 +201,7 @@ def filter_median(experiments, obj_cols, min_undesired=None):
 
 def filter_prim(experiments: pd.DataFrame, prim_box: dict) -> np.ndarray:
     """PRIM-box filter: keep experiments whose deep-uncertainty values fall
-    inside the box defined by `prim_box`. Mirrors notebook cell 11.
-
-    `prim_box` is a dict mapping uncertainty name → (lower, upper).
-    Uncertainties not mentioned in the box are unconstrained.
+    inside the box defined by `prim_box`.
     """
     if not prim_box:
         raise ValueError("prim_box must be a non-empty dict.")
@@ -227,8 +217,7 @@ def filter_prim(experiments: pd.DataFrame, prim_box: dict) -> np.ndarray:
 # ── Stage 2: normalise & diversity selection ─────────────────────────────────
 
 def normalise_outcomes(arr: np.ndarray) -> np.ndarray:
-    """Min-max normalise each column independently to [0, 1]. Mirrors
-    `normalize_out_dic` in MaxDiverseSelect.py.
+    """Min-max normalise each column independently to [0, 1].
     """
     mn, mx = arr.min(axis=0), arr.max(axis=0)
     rng = np.where(mx - mn == 0, 1.0, mx - mn)
@@ -237,8 +226,7 @@ def normalise_outcomes(arr: np.ndarray) -> np.ndarray:
 
 def diversity_score(subset_outcomes: np.ndarray, w: float = 0.5) -> float:
     """Carlsen et al. (2016) weighted diversity: D = (1-w)·min + w·mean of
-    pairwise Euclidean distances. Mirrors `evaluate_diversity_single` in
-    MaxDiverseSelect.py.
+    pairwise Euclidean distances.
     """
     if len(subset_outcomes) < 2:
         return 0.0
@@ -249,12 +237,6 @@ def diversity_score(subset_outcomes: np.ndarray, w: float = 0.5) -> float:
 def find_maxdiverse(outcomes_norm: np.ndarray, k: int, w: float = 0.5,
                     exhaustive_cap: int = 1_000_000):
     """Pick k indices maximising Carlsen diversity over normalised outcomes.
-
-    Exhaustive search if (n choose k) ≤ exhaustive_cap. The original
-    MaxDiverseSelect.py does pure exhaustive search using multiprocessing
-    over batches of 1M; we keep the exhaustive path for ≤1M and fall back
-    to greedy farthest-point + hill-climbing above that to keep runtime
-    bounded on a single thread.
     """
     n = len(outcomes_norm)
     if n < k:
@@ -302,13 +284,7 @@ def find_maxdiverse(outcomes_norm: np.ndarray, k: int, w: float = 0.5,
 def extract_reference_scenarios(experiments: pd.DataFrame,
                                  chosen_idx: list) -> pd.DataFrame:
     """For each of the K chosen experiments, return the (b1, q1, b2, q2,
-    inflow_seed1, inflow_seed2) values as one row of the output. Mirrors
-    cell 12 of ScenarioVisualization.ipynb (`diverse[['b','q', ...]]`).
-
-    Same scenario can appear multiple times if the diversity selection
-    happened to pick multiple (policy, scenario) experiments with the same
-    underlying scenario (rare with K=4 over hundreds of experiments).
-    Duplicates are kept — the original code keeps them too.
+    inflow_seed1, inflow_seed2) values as one row of the output.
     """
     cols = list(UNCERTAINTY_BOUNDS.keys())
     selected = experiments.iloc[chosen_idx][cols].copy().reset_index(drop=True)
@@ -317,6 +293,12 @@ def extract_reference_scenarios(experiments: pd.DataFrame,
 
 
 # ── End-to-end ────────────────────────────────────────────────────────────────
+
+_ENV_CLASSES = {
+    "unconstrained": TwoLakeEnv,
+    "constrained":   ConstrainedTwoLakeEnv,
+}
+
 
 def run(filter_type: str = "mean",
         prim_box: dict = None,
@@ -328,6 +310,7 @@ def run(filter_type: str = "mean",
         exhaustive_cap: int = 1_000_000,
         n_obj: int = 6,
         min_undesired: int = None,
+        env_type: str = "unconstrained",
         out_path: str = "lake_reference_scenarios.csv"):
     """Three-stage Bartholomew & Kwakkel (2020) scenario selection.
 
@@ -339,7 +322,25 @@ def run(filter_type: str = "mean",
     the original strict filter). With 6 anti-correlated lake objectives the
     strict filter often empties the candidate set; pass e.g.
     `min_undesired=4` to relax.
+
+    `env_type` ∈ {'unconstrained', 'constrained'} selects which environment
+    drives the per-experiment outcomes used by the policy-relevance filter
+    and the diversity selection. The two problems have materially different
+    outcome landscapes — the constrained env carries a violation penalty
+    that shifts which scenarios look "hard" — so the reference sets they
+    produce are different. Pick the env that matches the problem you'll
+    optimize for; pass each env separately to get a reference set per
+    problem.
+
+    Every LHS draw from the configured `UNCERTAINTY_BOUNDS` is u=0 feasible
+    by construction (the bounds were tightened to eliminate the structurally
+    infeasible corner of the canonical box), so no feasibility filtering is
+    applied to the candidate pool.
     """
+    if env_type not in _ENV_CLASSES:
+        raise ValueError(f"env_type must be one of {list(_ENV_CLASSES)}; "
+                         f"got {env_type!r}.")
+    env_cls = _ENV_CLASSES[env_type]
     rng = np.random.default_rng(seed)
 
     # Stage 1a-b
@@ -350,11 +351,28 @@ def run(filter_type: str = "mean",
     scenarios = generate_scenarios(n_scenarios, rng)
 
     # Stage 1c
-    print(f"  running {n_policies}×{n_scenarios} = {n_policies*n_scenarios} "
-          f"experiments...")
-    experiments = run_experiments(policies, scenarios, num_obj=n_obj)
+    print(f"  running {n_policies}×{n_scenarios} = "
+          f"{n_policies*n_scenarios} experiments under {env_cls.__name__}...")
+    experiments = run_experiments(policies, scenarios,
+                                  num_obj=n_obj, env_cls=env_cls)
 
     obj_cols = [f"o{k+1}" for k in range(n_obj)]
+
+    # Stage 1c′ (constrained only): drop penalty-affected experiments before
+    # the policy-relevance filter. The constrained env applies a uniform
+    # −VIOLATION_PENALTY to every axis per violating year, so any infeasible
+    # experiment has at least one axis ≤ ≈−8 (=−10+feasible_base_max); the
+    # feasible region keeps every axis ≥ ≈−1. The −5 cut sits cleanly in
+    # the gap.
+    if env_type == "constrained":
+        FEASIBILITY_CUT = -5.0
+        obj_vals = experiments[obj_cols].values
+        feasible_mask = (obj_vals >= FEASIBILITY_CUT).all(axis=1)
+        n_drop = int((~feasible_mask).sum())
+        print(f"  dropping {n_drop} penalty-affected experiments "
+              f"(any outcome < {FEASIBILITY_CUT}); "
+              f"{int(feasible_mask.sum())} feasible remain")
+        experiments = experiments[feasible_mask].reset_index(drop=True)
 
     if min_undesired is None:
         min_undesired = n_obj  # strict: all outcomes in undesired half
@@ -451,8 +469,27 @@ if __name__ == "__main__":
                         "relevant. Defaults to all (n_obj). Use a smaller "
                         "value to relax the filter when 6-obj joint filter "
                         "empties.")
-    p.add_argument("--out", default="lake_reference_scenarios.csv")
+    p.add_argument("--env-type",
+                   choices=["unconstrained", "constrained"],
+                   default="unconstrained",
+                   help="Problem the references are selected for. "
+                        "Unconstrained uses TwoLakeEnv (pure objective "
+                        "outcomes); constrained uses ConstrainedTwoLakeEnv "
+                        "(penalized outcomes). The two yield different "
+                        "reference sets — pick separately per problem.")
+    p.add_argument("--out", default=None,
+                   help="Output CSV path. Default: "
+                        "'lake_reference_scenarios.csv' for "
+                        "--env-type unconstrained, "
+                        "'constrained_lake_reference_scenarios.csv' "
+                        "for --env-type constrained.")
     args = p.parse_args()
+
+    out_path = args.out
+    if out_path is None:
+        out_path = ("constrained_lake_reference_scenarios.csv"
+                    if args.env_type == "constrained"
+                    else "lake_reference_scenarios.csv")
 
     prim_box = None
     if args.prim_box is not None:
@@ -470,4 +507,5 @@ if __name__ == "__main__":
         exhaustive_cap=args.exhaustive_cap,
         n_obj=args.n_obj,
         min_undesired=args.min_undesired,
-        out_path=args.out)
+        env_type=args.env_type,
+        out_path=out_path)

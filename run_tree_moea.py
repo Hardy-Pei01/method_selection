@@ -47,18 +47,18 @@ def tree():
 
 
 nfe_settings = tree()
-nfe_settings['intertemporal']['single']['multi_obj']['deterministic'] = 20000
-nfe_settings['intertemporal']['single']['many_obj']['deterministic'] = 20000
-nfe_settings['table']['single']['multi_obj']['deterministic'] = 20000
-nfe_settings['table']['single']['many_obj']['deterministic'] = 20000
-nfe_settings['intertemporal']['multi']['multi_obj']['robust'] = 20000
-nfe_settings['intertemporal']['multi']['many_obj']['robust'] = 20000
-nfe_settings['table']['multi']['multi_obj']['robust'] = 20000
-nfe_settings['table']['multi']['many_obj']['robust'] = 20000
-nfe_settings['intertemporal']['moro']['multi_obj']['robust'] = 40000
-nfe_settings['intertemporal']['moro']['many_obj']['robust'] = 40000
-nfe_settings['table']['moro']['multi_obj']['robust'] = 40000
-nfe_settings['table']['moro']['many_obj']['robust'] = 100000
+nfe_settings['intertemporal']['single']['multi_obj']['deterministic'] = 25000
+nfe_settings['intertemporal']['single']['many_obj']['deterministic'] = 25000
+nfe_settings['table']['single']['multi_obj']['deterministic'] = 25000
+nfe_settings['table']['single']['many_obj']['deterministic'] = 25000
+nfe_settings['intertemporal']['multi']['multi_obj']['robust'] = 25000
+nfe_settings['intertemporal']['multi']['many_obj']['robust'] = 25000
+nfe_settings['table']['multi']['multi_obj']['robust'] = 25000
+nfe_settings['table']['multi']['many_obj']['robust'] = 25000
+nfe_settings['intertemporal']['moro']['multi_obj']['robust'] = 60000
+nfe_settings['intertemporal']['moro']['many_obj']['robust'] = 60000
+nfe_settings['table']['moro']['multi_obj']['robust'] = 60000
+nfe_settings['table']['moro']['many_obj']['robust'] = 150000
 
 model_settings = tree()
 model_settings['intertemporal']['multi_obj']['deterministic']['observable'] = (inter_tree_model, 'interMulti')
@@ -134,7 +134,7 @@ if __name__ == '__main__':
 
                             # ── Replication loop over random seeds ───────────
                             for seed in seeds:
-                                name = f'{base_name}_seed{seed}'
+                                name = f'{base_name}/seed{seed}'
                                 print('--------------------------------------------------------------------')
                                 print(f"This experiment is {name}, with depth={tree_depth}, num_obj={num_obj}")
                                 print('--------------------------------------------------------------------')

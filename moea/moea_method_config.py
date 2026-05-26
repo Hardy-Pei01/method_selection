@@ -49,9 +49,9 @@ class base_lake_params(base_params):
     def __init__(self, name, nfe, algo, root_folder, many_obj, robust, seed=None):
         super().__init__(name, nfe, algo, root_folder, robust, seed)
         if many_obj:
-            self.epsilons = [0.5, 0.5, 0.1, 0.1, 0.1, 0.1]
+            self.epsilons = [0.05, 0.05, 0.25, 0.25, 0.05, 0.05]
         else:
-            self.epsilons = [0.05, 0.01]
+            self.epsilons = [0.01, 0.05]
 
 
 class multi_lake_params(base_lake_params):
@@ -107,9 +107,9 @@ class base_constrained_lake_params(base_params):
     def __init__(self, name, nfe, algo, root_folder, many_obj, robust, seed=None):
         super().__init__(name, nfe, algo, root_folder, robust, seed)
         if many_obj:
-            self.epsilons = [0.5, 0.5, 0.5, 0.5, 0.1, 0.1]
+            self.epsilons = [0.05, 0.05, 0.25, 0.25, 0.05, 0.05]
         else:
-            self.epsilons = [0.05, 0.05]
+            self.epsilons = [0.01, 0.05]
 
 
 class constrained_multi_lake_params(base_constrained_lake_params):

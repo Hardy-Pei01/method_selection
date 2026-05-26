@@ -14,7 +14,7 @@ from collections import defaultdict
 import time
 
 activate_logging = 1
-root_folder = f'./constrained_lake_ea'
+root_folder = f'./constrained_lake_ea_1'
 
 run_policy = {
     'intertemporal': 1,
@@ -47,18 +47,18 @@ def nested_dict():
 
 
 nfe_settings = nested_dict()
-nfe_settings['intertemporal']['single']['multi_obj']['deterministic'] = 100000
-nfe_settings['intertemporal']['single']['many_obj']['deterministic'] = 200000
-nfe_settings['dps']['single']['multi_obj']['deterministic'] = 100000
-nfe_settings['dps']['single']['many_obj']['deterministic'] = 200000
-nfe_settings['intertemporal']['multi']['multi_obj']['robust'] = 100000
-nfe_settings['intertemporal']['multi']['many_obj']['robust'] = 200000
-nfe_settings['dps']['multi']['multi_obj']['robust'] = 100000
-nfe_settings['dps']['multi']['many_obj']['robust'] = 200000
-nfe_settings['intertemporal']['moro']['multi_obj']['robust'] = 100000
-nfe_settings['intertemporal']['moro']['many_obj']['robust'] = 200000
-nfe_settings['dps']['moro']['multi_obj']['robust'] = 100000
-nfe_settings['dps']['moro']['many_obj']['robust'] = 200000
+nfe_settings['intertemporal']['single']['multi_obj']['deterministic'] = 120000
+nfe_settings['intertemporal']['single']['many_obj']['deterministic'] = 300000
+nfe_settings['dps']['single']['multi_obj']['deterministic'] = 120000
+nfe_settings['dps']['single']['many_obj']['deterministic'] = 300000
+nfe_settings['intertemporal']['multi']['multi_obj']['robust'] = 120000
+nfe_settings['intertemporal']['multi']['many_obj']['robust'] = 300000
+nfe_settings['dps']['multi']['multi_obj']['robust'] = 120000
+nfe_settings['dps']['multi']['many_obj']['robust'] = 300000
+nfe_settings['intertemporal']['moro']['multi_obj']['robust'] = 120000
+nfe_settings['intertemporal']['moro']['many_obj']['robust'] = 300000
+nfe_settings['dps']['moro']['multi_obj']['robust'] = 120000
+nfe_settings['dps']['moro']['many_obj']['robust'] = 300000
 
 model_settings = nested_dict()
 model_settings['intertemporal']['multi_obj']['deterministic'] = (constrained_inter_lake_model, 'interMulti')
@@ -76,48 +76,50 @@ num_objectives = {
 }
 
 if __name__ == '__main__':
-    if activate_logging:
-        ema_logging.log_to_stderr(ema_logging.INFO)
 
-    for key_1, value_1 in run_policy.items():
-        if not value_1:
-            continue
+    # ── Replication loop over random seeds ───────
+    for seed in seeds:
 
-        for key_2, value_2 in run_evo_method.items():
-            if not value_2:
+        if activate_logging:
+            ema_logging.log_to_stderr(ema_logging.INFO)
+
+        for key_1, value_1 in run_policy.items():
+            if not value_1:
                 continue
 
-            for key_3, value_3 in run_scenario_method.items():
-                if not value_3:
+            for key_2, value_2 in run_evo_method.items():
+                if not value_2:
                     continue
 
-                for key_4, value_4 in obj_uncertain.items():
-                    if not value_4:
+                for key_3, value_3 in run_scenario_method.items():
+                    if not value_3:
                         continue
 
-                    for key_5, value_5 in param_uncertain.items():
-                        if not value_5:
+                    for key_4, value_4 in obj_uncertain.items():
+                        if not value_4:
                             continue
 
-                        if key_3 == 'single' and key_5 == 'robust':
-                            continue
-                        if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
-                            continue
+                        for key_5, value_5 in param_uncertain.items():
+                            if not value_5:
+                                continue
 
-                        num_obj = num_objectives[key_4]
-                        base_name = f'{key_1}_{key_2}_{key_3}_{num_obj}'
-                        nfe = nfe_settings[key_1][key_3][key_4][key_5]
+                            if key_3 == 'single' and key_5 == 'robust':
+                                continue
+                            if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
+                                continue
 
-                        robust = (key_5 == 'robust')
-                        many_obj = (key_4 == 'many_obj')
-                        model_params = (constrained_many_objs_lake_params if many_obj
-                                        else constrained_multi_objs_lake_params)
-                        model_func, model_name = model_settings[key_1][key_4][key_5]
-                        model = model_func(model_params, model_name)
+                            num_obj = num_objectives[key_4]
+                            base_name = f'{key_1}_{key_2}_{key_3}_{num_obj}'
+                            nfe = nfe_settings[key_1][key_3][key_4][key_5]
 
-                        # ── Replication loop over random seeds ───────
-                        for seed in seeds:
-                            name = f'{base_name}_seed{seed}'
+                            robust = (key_5 == 'robust')
+                            many_obj = (key_4 == 'many_obj')
+                            model_params = (constrained_many_objs_lake_params if many_obj
+                                            else constrained_multi_objs_lake_params)
+                            model_func, model_name = model_settings[key_1][key_4][key_5]
+                            model = model_func(model_params, model_name)
+
+                            name = f'{base_name}/seed{seed}'
                             print('--------------------------------------------------------------------')
                             print(f"This experiment is {name}")
                             print('--------------------------------------------------------------------')

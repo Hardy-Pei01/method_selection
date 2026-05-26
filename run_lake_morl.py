@@ -12,7 +12,7 @@ from morl.morl_method_config import (
 )
 
 # ── Top-level output folder ───────────────────────────────────────────────────
-root_folder = './lake_rl'
+root_folder = './lake_rl_2'
 
 # ── Experiment toggles ────────────────────────────────────────────────────────
 
@@ -23,14 +23,14 @@ run_scoring = {
 }
 
 run_scenario_method = {
-    'single': 1,
-    'multi': 0,
+    'single': 0,
+    'multi': 1,
     'moro': 0
 }
 
 obj_uncertain = {
     'multi_obj': 1,
-    'many_obj': 1
+    'many_obj': 0
 }
 
 param_uncertain = {
@@ -46,12 +46,12 @@ def _nested():
 
 
 timestep_settings = _nested()
-timestep_settings['single']['multi_obj']['deterministic'] = 50000
-timestep_settings['single']['many_obj']['deterministic'] = 100000
-timestep_settings['multi']['multi_obj']['robust'] = 50000
-timestep_settings['multi']['many_obj']['robust'] = 100000
-timestep_settings['moro']['multi_obj']['robust'] = 50000
-timestep_settings['moro']['many_obj']['robust'] = 100000
+timestep_settings['single']['multi_obj']['deterministic'] = 150000
+timestep_settings['single']['many_obj']['deterministic'] = 300000
+timestep_settings['multi']['multi_obj']['robust'] = 150000
+timestep_settings['multi']['many_obj']['robust'] = 300000
+timestep_settings['moro']['multi_obj']['robust'] = 300000
+timestep_settings['moro']['many_obj']['robust'] = 600000
 
 # ── PQL hyperparameters ───────────────────────────────────────────────────────
 
@@ -61,12 +61,9 @@ num_weight_divisions = {
 }
 
 # ── Objective metadata ────────────────────────────────────────────────────────
-# Reference points must be strictly below all achievable reward values.
-# Lake rewards: utility in [0, ~2], reliability in [0, 1], -inertia in [-1, 0].
-# np.full(n_obj, -1.0) is a safe lower bound for all objectives.
 ref_points = {
-    'multi_obj': np.full(lake_multi_obj, -1.1),
-    'many_obj': np.full(lake_many_obj, -1.1),
+    'multi_obj': np.full(lake_multi_obj, -5.0),
+    'many_obj': np.full(lake_many_obj, -5.0),
 }
 num_objectives = {
     'multi_obj': lake_multi_obj,
@@ -77,39 +74,39 @@ num_objectives = {
 
 if __name__ == '__main__':
 
-    for key_1, val_1 in run_scoring.items():
-        if not val_1:
-            continue
+    # ── Replication loop over random seeds ───────────
+    for seed in seeds:
 
-        for key_3, val_3 in run_scenario_method.items():
-            if not val_3:
+        for key_1, val_1 in run_scoring.items():
+            if not val_1:
                 continue
 
-            for key_4, val_4 in obj_uncertain.items():
-                if not val_4:
+            for key_3, val_3 in run_scenario_method.items():
+                if not val_3:
                     continue
 
-                for key_5, val_5 in param_uncertain.items():
-                    if not val_5:
+                for key_4, val_4 in obj_uncertain.items():
+                    if not val_4:
                         continue
 
-                    # Enforce valid (scenario_method, uncertainty) combinations —
-                    # mirrors the same guards in run_tree_morl.py and run_lake_moea.py.
-                    if key_3 == 'single' and key_5 == 'robust':
-                        continue  # single only makes sense without param uncertainty
-                    if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
-                        continue  # multi/moro require param uncertainty
+                    for key_5, val_5 in param_uncertain.items():
+                        if not val_5:
+                            continue
 
-                    timesteps = timestep_settings[key_3][key_4][key_5]
-                    n_obj = num_objectives[key_4]
-                    ref = ref_points[key_4]
-                    nwd = num_weight_divisions[key_4]
-                    robust = (key_5 == 'robust')
-                    base_name = f'{key_1}_{key_3}_{n_obj}'
+                        # Enforce valid (scenario_method, uncertainty) combinations —
+                        # mirrors the same guards in run_tree_morl.py and run_lake_moea.py.
+                        if key_3 == 'single' and key_5 == 'robust':
+                            continue  # single only makes sense without param uncertainty
+                        if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
+                            continue  # multi/moro require param uncertainty
 
-                    # ── Replication loop over random seeds ───────────
-                    for seed in seeds:
-                        name = f'{base_name}_seed{seed}'
+                        timesteps = timestep_settings[key_3][key_4][key_5]
+                        n_obj = num_objectives[key_4]
+                        ref = ref_points[key_4]
+                        nwd = num_weight_divisions[key_4]
+                        robust = (key_5 == 'robust')
+                        base_name = f'{key_1}_{key_3}_{n_obj}'
+                        name = f'{base_name}/seed{seed}'
                         print('--------------------------------------------------------------------')
                         print(f'This experiment is {name}')
                         print('--------------------------------------------------------------------')

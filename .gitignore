@@ -9,3 +9,5 @@ tree_data/
 previous_fruits/
 .ipynb_checkpoints/
 *data/
+*data_1/
+analysis/
