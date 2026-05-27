@@ -2,109 +2,224 @@ import os, re, glob, json, time
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from moocore import hypervolume as _exact_hv
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from two_lake import TwoLakeEnv
+
+from utils import (
+    MC_SAMPLES_6OBJ, MC_SEED, _hv_exact, _hv_mc,
+    _nd_filter_max, _seed_idx, _spacing_norm,
+)
 
 # ----------------------------------------------------------------------
-# Experiment selection — flip 1/0
+# Experiment scope — deterministic MOEA, env-replay on default scenario.
+# Mirrors the deterministic MORL pipeline (default_lake_scenario) so
+# MOEA and MORL go through the same eval path.
 # ----------------------------------------------------------------------
 INPUT_ROOT = '../data/lake_data_2/'
 OUTPUT_ROOT = '../data/lake_data_2'
-SETTING = 'deterministic'  # robust uses robust_lake_moea_reeval.py
+SETTING = 'deterministic'
 
-run_moea_method = {
-    'NSGAII': 1,
-    'IBEA': 1,
-    'MOEAD': 1,
-}
-run_policy = {
-    'intertemporal': 1,
-    'dps': 1,
-}
+run_moea_method = {'NSGAII': 1, 'IBEA': 1, 'MOEAD': 1}
+run_policy = {'intertemporal': 1, 'dps': 1}
 run_n_obj = {2: 1, 6: 1}
 
-MC_SAMPLES_6OBJ = 50_000
-MC_SEED = 12345
+
+# Parallelism: 0 = auto (os.cpu_count()), 1 = serial (debug), N>0 = N workers
+N_WORKERS = 0
+
+# Deterministic training folder: `{policy}_{method}_single_{n_obj}`
+FOLDER_RE = re.compile(
+    r'^(intertemporal|dps)_(NSGAII|IBEA|MOEAD)_single_(\d+)$')
+
+# ----------------------------------------------------------------------
+# Worker-global state (set by _worker_init)
+# ----------------------------------------------------------------------
+_EVAL_SCENARIOS = None
+
+
+def _worker_init(eval_scenarios):
+    global _EVAL_SCENARIOS
+    _EVAL_SCENARIOS = eval_scenarios
 
 
 # ----------------------------------------------------------------------
-# Front loading — deterministic single-scenario MOEA: stored o* IS the
-# realised return, so we read it directly (no env replay).
+# Scenario + env construction (identical to lake_morl_reeval.py)
 # ----------------------------------------------------------------------
-def _obj_cols(df):
-    return sorted(
-        [c for c in df.columns if re.fullmatch(r'o\d+', c)],
-        key=lambda c: int(re.search(r'\d+', c).group()))
+def _scenario_dict_from_struct(s):
+    return {
+        'b1': float(s['b1']), 'q1': float(s['q1']),
+        'b2': float(s['b2']), 'q2': float(s['q2']),
+        'inflow_seed1': int(s['inflow_seed1']),
+        'inflow_seed2': int(s['inflow_seed2']),
+        'Pcrit1': float(s['Pcrit1']) if s['Pcrit1'] is not None else None,
+        'Pcrit2': float(s['Pcrit2']) if s['Pcrit2'] is not None else None,
+    }
 
 
-def _front_maxconv(path):
-    """MOEA archives are MIN-conv -> negate to MAX-conv."""
-    df = pd.read_csv(path)
-    v = df[_obj_cols(df)].values.astype(float)
-    return -v
+def _build_env(scenario_dict, n_obj):
+    return TwoLakeEnv(
+        b1=scenario_dict['b1'], q1=scenario_dict['q1'],
+        b2=scenario_dict['b2'], q2=scenario_dict['q2'],
+        inflow_seed1=scenario_dict['inflow_seed1'],
+        inflow_seed2=scenario_dict['inflow_seed2'],
+        Pcrit1=scenario_dict.get('Pcrit1'),
+        Pcrit2=scenario_dict.get('Pcrit2'),
+        num_obj=n_obj,
+    )
 
 
-def _seed_dirs(base, stem):
-    root = os.path.join(base, stem)
-    if not os.path.isdir(root):
-        return []
-    return sorted(d for d in glob.glob(os.path.join(root, 'seed*'))
-                  if os.path.isdir(d))
-
-
-def _only_csv(folder, prefix):
-    hits = [f for f in os.listdir(folder)
-            if f.startswith(prefix) and f.endswith('.csv')
-            and not f.endswith('_evaluated.csv')]
-    return os.path.join(folder, hits[0]) if hits else None
-
-
-def _enabled_cells():
-    """Yield (paradigm, method, condition, n_obj, seed_idx, front_maxconv)."""
-    moea_base = os.path.join(INPUT_ROOT, SETTING, 'moea')
-    for n_obj, on in run_n_obj.items():
-        if not on:
-            continue
-        for method, m_on in run_moea_method.items():
-            if not m_on:
-                continue
-            for policy, p_on in run_policy.items():
-                if not p_on:
-                    continue
-                stem = f'{policy}_{method}_single_{n_obj}'
-                sds = _seed_dirs(moea_base, stem)
-                if not sds:
-                    continue
-                cond = f'{policy}_single'
-                for sd in sds:
-                    csv = _only_csv(sd, 'archives_')
-                    if csv:
-                        k = int(re.search(r'seed(\d+)', sd).group(1))
-                        yield ('MOEA', method, cond, n_obj, k,
-                               _front_maxconv(csv))
+def _load_deterministic_scenario():
+    """MOEA-deterministic was trained at default_lake_scenario, just
+    like MORL-deterministic. Re-evaluate there too."""
+    from params_config import default_lake_scenario
+    return [_scenario_dict_from_struct(default_lake_scenario)]
 
 
 # ----------------------------------------------------------------------
-# Hypervolume (MAX convention) — IDENTICAL to lake_morl_reeval.py
+# Policy rollouts (MAX-conv) — identical to robust_lake_moea_reeval.
 # ----------------------------------------------------------------------
-def _hv_exact(front_max, ref_min):
-    if len(front_max) == 0:
-        return 0.0
-    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
+def _rollout_intertemporal(env, decisions_u1, decisions_u2):
+    env.reset()
+    total = np.zeros(env.num_obj, dtype=np.float64)
+    for t in range(env.n_gym_steps):
+        _, reward, _, _, _ = env.step(
+            np.array([decisions_u1[t], decisions_u2[t]], dtype=np.int64))
+        total += np.asarray(reward, dtype=np.float64)
+    return total
 
 
-def _hv_mc(front_max, lo, hi, samples):
-    if len(front_max) == 0:
-        return 0.0
-    F = np.ascontiguousarray(front_max, float)
-    N = samples.shape[0]
-    dom = np.zeros(N, dtype=bool)
-    blk = 2000
-    for i in range(0, N, blk):
-        S = samples[i:i + blk]
-        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
-    return float(dom.mean() * np.prod(hi - lo))
+def _emission_from_rbf(xt, c1, c2, r1, r2, w1):
+    rule = w1 * (abs(xt - c1) / r1) ** 3 + (1 - w1) * (abs(xt - c2) / r2) ** 3
+    u = float(np.clip(rule, 0.0, 0.10))
+    return int(round(u / 0.02))
 
 
+def _rollout_dps(env, c1_1, c2_1, r1_1, r2_1, w1_1,
+                 c1_2, c2_2, r1_2, r2_2, w1_2):
+    env.reset()
+    total = np.zeros(env.num_obj, dtype=np.float64)
+    for _ in range(env.n_gym_steps):
+        X1, X2 = env.X1, env.X2
+        u1 = _emission_from_rbf(X1, c1_1, c2_1, r1_1, r2_1, w1_1)
+        u2 = _emission_from_rbf(X2, c1_2, c2_2, r1_2, r2_2, w1_2)
+        _, reward, _, _, _ = env.step(np.array([u1, u2], dtype=np.int64))
+        total += np.asarray(reward, dtype=np.float64)
+    return total
+
+
+def _eval_policy_on_scenarios(row, policy_kind, scenarios, n_obj,
+                              u1_keys=None, u2_keys=None):
+    """Replay one policy across all `scenarios`; return MEAN per-obj
+    realised return (MAX-conv). For deterministic this is len(scenarios)==1."""
+    sums = np.zeros(n_obj, dtype=np.float64)
+    n = len(scenarios)
+    if policy_kind == 'intertemporal':
+        u1 = [int(row[c]) for c in u1_keys]
+        u2 = [int(row[c]) for c in u2_keys]
+        for s in scenarios:
+            env = _build_env(s, n_obj)
+            sums += _rollout_intertemporal(env, u1, u2)
+    elif policy_kind == 'dps':
+        c1_1, c2_1 = float(row['c1_1']), float(row['c2_1'])
+        r1_1, r2_1 = float(row['r1_1']), float(row['r2_1'])
+        w1_1 = float(row['w1_1'])
+        c1_2, c2_2 = float(row['c1_2']), float(row['c2_2'])
+        r1_2, r2_2 = float(row['r1_2']), float(row['r2_2'])
+        w1_2 = float(row['w1_2'])
+        for s in scenarios:
+            env = _build_env(s, n_obj)
+            sums += _rollout_dps(env, c1_1, c2_1, r1_1, r2_1, w1_1,
+                                 c1_2, c2_2, r1_2, r2_2, w1_2)
+    else:
+        raise ValueError(f'unknown policy_kind {policy_kind!r}')
+    return sums / n
+
+
+def _reevaluate_archive(archive_path, policy_kind, n_obj, scenarios):
+    """Returns (n_policies, n_obj) array of MEAN realised returns in
+    MIN-conv (matching MOEA archive sign)."""
+    df = pd.read_csv(archive_path)
+    n_pol = len(df)
+    if n_pol == 0:
+        return np.empty((0, n_obj))
+    u1_keys = u2_keys = None
+    if policy_kind == 'intertemporal':
+        u1_keys = sorted(
+            [c for c in df.columns if re.fullmatch(r'u1_\d+', c)],
+            key=lambda c: int(re.search(r'\d+', c).group()))
+        u2_keys = sorted(
+            [c for c in df.columns if re.fullmatch(r'u2_\d+', c)],
+            key=lambda c: int(re.search(r'\d+', c).group()))
+    out_min = np.empty((n_pol, n_obj), dtype=np.float64)
+    for i, row in df.iterrows():
+        mean_pos = _eval_policy_on_scenarios(
+            row, policy_kind, scenarios, n_obj,
+            u1_keys=u1_keys, u2_keys=u2_keys)
+        out_min[i] = -mean_pos  # MAX-conv -> MIN-conv
+    return out_min
+
+
+# ----------------------------------------------------------------------
+# Worker task: re-evaluate one (config, seed) cell
+# ----------------------------------------------------------------------
+def _process_one_seed(task):
+    sd_dir = task['sd_dir']
+    k = task['seed']
+    policy_kind = task['policy']
+    n_obj = task['n_obj']
+    out_csv_seed = task['out_csv_seed']
+    meta = task['meta']
+    scenarios = _EVAL_SCENARIOS
+
+    t0 = time.time()
+    archives = sorted(
+        f for f in glob.glob(os.path.join(sd_dir, 'archives_*.csv'))
+        if not f.endswith('_evaluated.csv'))
+    if not archives:
+        return {**meta, 'seed': k, 'front_max': None,
+                'dt': 0.0, 'note': 'no archive files'}
+
+    per_archive_min = []
+    for archpath in archives:
+        arr = _reevaluate_archive(archpath, policy_kind, n_obj, scenarios)
+        per_archive_min.append(arr)
+
+    if not per_archive_min or sum(len(a) for a in per_archive_min) == 0:
+        return {**meta, 'seed': k, 'front_max': None,
+                'dt': time.time() - t0, 'note': 'no policies parsed'}
+
+    pooled_min = np.vstack(per_archive_min)
+    front_max = _nd_filter_max(-pooled_min)
+
+    n_archives = len(archives)
+    n_total_pol = int(sum(len(a) for a in per_archive_min))
+    n_dom = n_total_pol - int(len(front_max))
+
+    os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
+    pd.DataFrame(
+        -front_max, columns=[f're_o{j + 1}' for j in range(n_obj)]
+    ).to_csv(out_csv_seed, index=False)
+
+    side = out_csv_seed.replace('.csv', '_meta.json')
+    with open(side, 'w') as f:
+        json.dump({'n_archives': n_archives,
+                   'n_total_pol': n_total_pol,
+                   'n_dom': n_dom}, f)
+
+    return {**meta, 'seed': k, 'front_max': front_max,
+            'dt': time.time() - t0,
+            'n_archives': n_archives,
+            'n_total_pol': n_total_pol,
+            'n_dom': n_dom,
+            'note': 'computed'}
+
+
+# ----------------------------------------------------------------------
+# HV machinery — deterministic box (same as lake_morl_reeval.py).
+# ----------------------------------------------------------------------
 def _fixed_box(n_obj):
     from params_config import (lake_box_deterministic_dim2,
                                lake_box_deterministic_dim6)
@@ -130,7 +245,7 @@ def _panel_machinery(cells, n_obj):
         hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
         meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
                     mc_seed=MC_SEED)
-    union = np.vstack([c[-1] for c in cells])
+    union = np.vstack([c[4] for c in cells])  # c[4] is front_max
     best_known_hv = hv(union)
     meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
                 box_volume=box_volume, best_known_hv=best_known_hv,
@@ -139,78 +254,204 @@ def _panel_machinery(cells, n_obj):
 
 
 # ----------------------------------------------------------------------
+# Discovery + task planning
+# ----------------------------------------------------------------------
+def _enabled_stems():
+    moea_base = os.path.join(INPUT_ROOT, SETTING, 'moea')
+    if not os.path.isdir(moea_base):
+        return
+    for d in sorted(os.listdir(moea_base)):
+        m = FOLDER_RE.match(d)
+        if not m:
+            continue
+        policy, algo, n_obj_s = m.groups()
+        n_obj = int(n_obj_s)
+        if not run_moea_method.get(algo, 0): continue
+        if not run_policy.get(policy, 0): continue
+        if not run_n_obj.get(n_obj, 0): continue
+        yield algo, policy, n_obj, os.path.join(moea_base, d)
+
+
+def _build_tasks(reeval_root):
+    tasks = []
+    prebuilt_cells = []  # (algo, policy, n_obj, seed, F_max,
+                         #  n_archives, n_total_pol, n_dom)
+    skipped = 0
+    for algo, policy, n_obj, stem_dir in _enabled_stems():
+        stem_name = os.path.basename(stem_dir)
+        cfg_out_dir = os.path.join(reeval_root, stem_name)
+        seeds = sorted(glob.glob(os.path.join(stem_dir, 'seed*')))
+        for sd_dir in seeds:
+            k = _seed_idx(sd_dir)
+            out_csv_seed = os.path.join(cfg_out_dir, f'seed{k}.csv')
+
+            if os.path.exists(out_csv_seed):
+                prev = pd.read_csv(out_csv_seed)
+                rec = [c for c in prev.columns
+                       if re.fullmatch(r're_o\d+', c)]
+                if rec:
+                    F_min = prev[rec].values
+                    side = out_csv_seed.replace('.csv', '_meta.json')
+                    if os.path.exists(side):
+                        with open(side) as sf:
+                            sd_meta = json.load(sf)
+                        n_arc = int(sd_meta.get('n_archives', 0))
+                        n_tot = int(sd_meta.get('n_total_pol', 0))
+                        n_dm  = int(sd_meta.get('n_dom', 0))
+                    else:
+                        n_arc = n_tot = n_dm = -1
+                    prebuilt_cells.append(
+                        (algo, policy, n_obj, k, -F_min,
+                         n_arc, n_tot, n_dm))
+                    skipped += 1
+                    continue
+
+            tasks.append({
+                'sd_dir': sd_dir,
+                'seed': k,
+                'policy': policy,
+                'n_obj': n_obj,
+                'out_csv_seed': out_csv_seed,
+                'meta': {'algo': algo, 'policy': policy, 'n_obj': n_obj},
+            })
+    return tasks, prebuilt_cells, skipped
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
     print('=' * 64)
-    print(f'EVALUATING setting = {SETTING} (lake, MOEA)')
+    print(f'EVALUATING setting = {SETTING} (lake, MOEA — env replay)')
     print('=' * 64)
 
-    cells = list(_enabled_cells())
+    eval_scenarios = _load_deterministic_scenario()
+    print(f'SETTING=deterministic — using 1 scenario (default_lake_scenario)')
+
+    out_root = os.path.join(OUTPUT_ROOT, SETTING, 'moea')
+    reeval_root = os.path.join(out_root, 'reeval_archives')
+    os.makedirs(reeval_root, exist_ok=True)
+
+    tasks, cells, skipped = _build_tasks(reeval_root)
+    n_total = len(tasks) + skipped
+    n_workers = (os.cpu_count() if N_WORKERS == 0 else N_WORKERS) or 1
+    n_workers = min(n_workers, max(1, len(tasks)))
+
+    print(f'\n=== Re-evaluating archives ({SETTING}) ===')
+    print(f'   {n_total} cells total; {skipped} already checkpointed, '
+          f'{len(tasks)} to compute with {n_workers} worker(s)')
+
+    t0_all = time.time()
+    if tasks:
+        if n_workers == 1:
+            _worker_init(eval_scenarios)
+            for i, task in enumerate(tasks, 1):
+                res = _process_one_seed(task)
+                if res.get('front_max') is not None:
+                    cells.append((res['algo'], res['policy'],
+                                  res['n_obj'], res['seed'],
+                                  res['front_max'],
+                                  res['n_archives'],
+                                  res['n_total_pol'],
+                                  res['n_dom']))
+                lbl = (f"{res['policy']}_{res['algo']}_{res['n_obj']}/"
+                       f"seed{res['seed']}")
+                if res.get('note') == 'computed':
+                    print(f"   [{i:3d}/{len(tasks)}] {lbl:50s} "
+                          f"{res['dt']:6.1f}s  {res['n_archives']} arch, "
+                          f"{res['n_total_pol']}→{len(res['front_max'])} pols "
+                          f"({res['n_dom']} dom)")
+                else:
+                    print(f"   [{i:3d}/{len(tasks)}] {lbl:50s}  {res['note']}")
+        else:
+            with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=_worker_init,
+                    initargs=(eval_scenarios,)) as pool:
+                futures = {pool.submit(_process_one_seed, t): t for t in tasks}
+                for i, fut in enumerate(as_completed(futures), 1):
+                    res = fut.result()
+                    if res.get('front_max') is not None:
+                        cells.append((res['algo'], res['policy'],
+                                      res['n_obj'], res['seed'],
+                                      res['front_max'],
+                                      res['n_archives'],
+                                      res['n_total_pol'],
+                                      res['n_dom']))
+                    lbl = (f"{res['policy']}_{res['algo']}_{res['n_obj']}/"
+                           f"seed{res['seed']}")
+                    if res.get('note') == 'computed':
+                        print(f"   [{i:3d}/{len(tasks)}] {lbl:50s} "
+                              f"{res['dt']:6.1f}s  {res['n_archives']} arch, "
+                              f"{res['n_total_pol']}→{len(res['front_max'])} pols "
+                              f"({res['n_dom']} dom)")
+                    else:
+                        print(f"   [{i:3d}/{len(tasks)}] {lbl:50s}  {res['note']}")
+
+    print(f'\n   re-evaluation phase done in {time.time() - t0_all:.1f}s')
+
     if not cells:
-        print(f'  no enabled+available runs for {SETTING} — '
-              f'check INPUT_ROOT={INPUT_ROOT}')
-        raise SystemExit(1)
+        raise SystemExit('no MOEA cells available — nothing to score')
 
-    by_para = defaultdict(set)
-    for paradigm, method, cond, n_obj, _, _ in cells:
-        by_para[paradigm].add((method, cond, n_obj))
-    print(f'\nfound {len(cells)} fronts:')
-    for p in sorted(by_para):
-        print(f'  {p}: {len(by_para[p])} (method, condition, n_obj) cells')
-
+    print('\n=== Computing HV on re-evaluated fronts ===')
     by_nobj = defaultdict(list)
     for c in cells:
-        by_nobj[c[3]].append(c)
+        by_nobj[c[2]].append(c)  # c[2] is n_obj
 
     rows = []
     meta = {'setting': SETTING,
-            'kind': 'evaluation_moea',
-            'source': 'archives_*.csv stored o* (no env replay)',
-            'aggregation': 'identity (single-scenario archive values)',
+            'kind': 'reevaluation_moea',
+            'n_eval_scenarios': len(eval_scenarios),
+            'aggregation': 'identity (single default scenario)',
+            'scenario_source': 'default_lake_scenario (matches deterministic MORL)',
+            'n_workers_used': n_workers,
             'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'scope': {
-                'moea': [k for k, v in run_moea_method.items() if v],
-                'policy': [k for k, v in run_policy.items() if v],
-                'n_obj': [k for k, v in run_n_obj.items() if v],
-            },
-            'note': ('Deterministic MOEA HV scoring. Single-scenario '
-                     'archives store realised o* directly (MIN-conv); '
-                     'negated to MAX-conv. Fixed HV box from '
-                     'params_config — identical to the box used for '
-                     'MORL scoring in lake_morl_reeval.py, so HV ratios '
-                     'are directly comparable across paradigms.'),
+            'note': ('Deterministic MOEA HV scoring with env replay on '
+                     'the default lake scenario. Matches the deterministic '
+                     'MORL pipeline so HV comparisons are computed on '
+                     'realised returns from the same eval scenario, '
+                     'not on archive-stored o*.'),
             'panels': {}}
 
     for n_obj, panel_cells in sorted(by_nobj.items()):
         hv, box_volume, pmeta = _panel_machinery(panel_cells, n_obj)
         meta['panels'][str(n_obj)] = pmeta
-        print(f'\n n_obj={n_obj}: {len(panel_cells)} runs, '
+        nadir = np.asarray(pmeta['box_nadir'], dtype=float)
+        ideal = np.asarray(pmeta['box_ideal'], dtype=float)
+        print(f'\n n_obj={n_obj}: {len(panel_cells)} re-evaluated cells, '
               f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
               f"best-known HV={pmeta['best_known_hv']:.5g} "
               f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
-        for paradigm, method, cond, no, seed, F in panel_cells:
+        for algo, policy, no, k, F, n_arc, n_tot, n_dm in panel_cells:
             h = hv(F)
+            s = _spacing_norm(F, nadir, ideal)
+            cond = f'{policy}_single'
             rows.append(dict(
-                paradigm=paradigm, method=method, condition=cond,
-                n_obj=no, seed=seed, n_solutions=int(len(F)),
+                paradigm='MOEA', method=algo, condition=cond,
+                policy=policy,
+                n_obj=no, seed=k,
+                n_archives=int(n_arc) if n_arc >= 0 else np.nan,
+                n_total_pol=int(n_tot) if n_tot >= 0 else np.nan,
+                n_dom=int(n_dm) if n_dm >= 0 else np.nan,
+                n_solutions=int(len(F)),
                 hv=h, box_volume=box_volume,
-                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
+                hv_ratio=(h / box_volume if box_volume > 0 else np.nan),
+                spacing_norm=s))
         agg = defaultdict(list)
         for r in rows:
             if r['n_obj'] == n_obj:
-                agg[(r['paradigm'], r['method'], r['condition'])].append(
-                    r['hv_ratio'])
-        for (p, m, c), vs in sorted(agg.items()):
-            print(f'   {p:4s} {m:14s} {c:24s} n={len(vs):2d} '
+                agg[(r['method'], r['condition'])].append(r['hv_ratio'])
+        for (m, c), vs in sorted(agg.items()):
+            print(f'   {m:8s} {c:32s} n={len(vs):3d} '
                   f'HVr={np.mean(vs):.4f}±{np.std(vs):.4f}')
 
-    out_dir = os.path.join(OUTPUT_ROOT, SETTING, 'moea')
-    os.makedirs(out_dir, exist_ok=True)
     df = pd.DataFrame(rows).sort_values(
         ['n_obj', 'paradigm', 'method', 'condition', 'seed'])
-    df.to_csv(os.path.join(out_dir, 'metrics_long_reeval.csv'), index=False)
-    with open(os.path.join(out_dir, '_meta_reeval.json'), 'w') as f:
+    out_csv = os.path.join(out_root, 'metrics_long_reeval.csv')
+    out_json = os.path.join(out_root, '_meta_reeval.json')
+    df.to_csv(out_csv, index=False)
+    with open(out_json, 'w') as f:
         json.dump(meta, f, indent=2)
-    print(f'\n  wrote {out_dir}/metrics_long_reeval.csv  ({len(df)} rows)')
-    print(f'  wrote {out_dir}/_meta_reeval.json')
+    print(f'\n  wrote {out_csv}  ({len(df)} rows)')
+    print(f'  wrote {out_json}')
+    print(f'  re-evaluated archives under {reeval_root}/')

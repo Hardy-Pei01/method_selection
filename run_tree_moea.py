@@ -9,20 +9,20 @@ from collections import defaultdict
 import time
 
 activate_logging = 1
-root_folder = f'./tree_ea_{tree_depth}'
+root_folder = f'./tree_ea_3'
 
 run_policy = {
     'intertemporal': 1,
     'table': 1
 }
 run_evo_method = {
-    'NSGAII': 1,
-    'IBEA': 1,
+    'NSGAII': 0,
+    'IBEA': 0,
     'MOEAD': 1
 }
 run_scenario_method = {
-    'single': 0,
-    'multi': 0,
+    'single': 1,
+    'multi': 1,
     'moro': 1
 }
 
@@ -38,7 +38,7 @@ param_uncertain = {
 
 observability = {
     'observable': 1,
-    'non_observable': 0
+    'non_observable': 1
 }
 
 
@@ -83,57 +83,58 @@ if __name__ == '__main__':
     if (activate_logging):
         ema_logging.log_to_stderr(ema_logging.INFO)
 
-    for key_1, value_1 in run_policy.items():
-        if not value_1:
-            continue
+    # ── Replication loop over random seeds ───────────
+    for seed in seeds:
 
-        for key_2, value_2 in run_evo_method.items():
-            if not value_2:
+        for key_1, value_1 in run_policy.items():
+            if not value_1:
                 continue
 
-            for key_3, value_3 in run_scenario_method.items():
-                if not value_3:
+            for key_2, value_2 in run_evo_method.items():
+                if not value_2:
                     continue
 
-                for key_4, value_4 in obj_uncertain.items():
-                    if not value_4:
+                for key_3, value_3 in run_scenario_method.items():
+                    if not value_3:
                         continue
 
-                    for key_5, value_5 in param_uncertain.items():
-                        if not value_5:
+                    for key_4, value_4 in obj_uncertain.items():
+                        if not value_4:
                             continue
 
-                        for key_6, value_6 in observability.items():
-                            if not value_6:
+                        for key_5, value_5 in param_uncertain.items():
+                            if not value_5:
                                 continue
 
-                            # Guard 1: single only with deterministic,
-                            #          multi/moro only with robust
-                            if key_3 == 'single' and key_5 == 'robust':
-                                continue
-                            if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
-                                continue
+                            for key_6, value_6 in observability.items():
+                                if not value_6:
+                                    continue
 
-                            # Guard 2: non-observable only for table+single+deterministic
-                            if key_6 == 'non_observable' and not (
-                                    key_1 == 'table' and
-                                    key_3 == 'single' and
-                                    key_5 == 'deterministic'):
-                                continue
+                                # Guard 1: single only with deterministic,
+                                #          multi/moro only with robust
+                                if key_3 == 'single' and key_5 == 'robust':
+                                    continue
+                                if key_3 in ('multi', 'moro') and key_5 == 'deterministic':
+                                    continue
 
-                            num_obj = num_objectives[key_4]
-                            base_name = f'{key_1}_{key_2}_{key_3}_{num_obj}_{key_6}'
-                            nfe = nfe_settings[key_1][key_3][key_4][key_5]
+                                # Guard 2: non-observable only for table+single+deterministic
+                                if key_6 == 'non_observable' and not (
+                                        key_1 == 'table' and
+                                        key_3 == 'single' and
+                                        key_5 == 'deterministic'):
+                                    continue
 
-                            robust = (key_5 == 'robust')
-                            many_obj = (key_4 == 'many_obj')
-                            model_params = many_objs_tree_params if many_obj else multi_objs_tree_params
+                                num_obj = num_objectives[key_4]
+                                base_name = f'{key_1}_{key_2}_{key_3}_{num_obj}_{key_6}'
+                                nfe = nfe_settings[key_1][key_3][key_4][key_5]
 
-                            model_func, model_name = model_settings[key_1][key_4][key_5][key_6]
-                            model = model_func(model_params, model_name)
+                                robust = (key_5 == 'robust')
+                                many_obj = (key_4 == 'many_obj')
+                                model_params = many_objs_tree_params if many_obj else multi_objs_tree_params
 
-                            # ── Replication loop over random seeds ───────────
-                            for seed in seeds:
+                                model_func, model_name = model_settings[key_1][key_4][key_5][key_6]
+                                model = model_func(model_params, model_name)
+
                                 name = f'{base_name}/seed{seed}'
                                 print('--------------------------------------------------------------------')
                                 print(f"This experiment is {name}, with depth={tree_depth}, num_obj={num_obj}")

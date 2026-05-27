@@ -1,6 +1,7 @@
 import math
 import random
 import functools
+import moea.ema_patch
 from platypus import AbstractGeneticAlgorithm
 from platypus._math import POSITIVE_INFINITY
 from platypus.operators import RandomGenerator, TournamentSelector

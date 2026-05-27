@@ -17,7 +17,7 @@ def run_moea(model, params, file_end, reference, ref_num, start_time):
         random.seed(params.seed)
         np.random.seed(params.seed)
 
-    with MultiprocessingEvaluator(model, n_processes=-2) as evaluator:
+    with MultiprocessingEvaluator(model, n_processes=32) as evaluator:
         arch, conv = evaluator.optimize(
             algorithm=params.algorithm,
             nfe=params.nfe,

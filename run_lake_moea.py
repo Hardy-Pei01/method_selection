@@ -8,11 +8,11 @@ from collections import defaultdict
 import time
 
 activate_logging = 1
-root_folder = f'./lake_ea_2'
+root_folder = f'./lake_ea_3'
 
 run_policy = {
-    'intertemporal': 0,
-    'dps': 1
+    'intertemporal': 1,
+    'dps': 0
 }
 run_evo_method = {
     'NSGAII': 0,
@@ -21,12 +21,12 @@ run_evo_method = {
 }
 run_scenario_method = {
     'single': 1,
-    'multi': 0,
-    'moro': 0
+    'multi': 1,
+    'moro': 1
 }
 
 obj_uncertain = {
-    'multi_obj': 0,
+    'multi_obj': 1,
     'many_obj': 1
 }
 

@@ -10,10 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from two_lake import TwoLakeEnv
 from morl.pql import PQL
 
-try:
-    from moocore import is_nondominated as _moo_is_nd
-except ImportError:
-    _moo_is_nd = None
+from utils import (
+    MC_SAMPLES_6OBJ, MC_SEED, _hv_exact, _hv_mc,
+    _nd_filter_min, _seed_idx, _spacing_norm, MAX_POLICIES_PER_AGENT
+)
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -24,13 +24,7 @@ OUTPUT_ROOT = '../data/lake_data_2'
 # 'deterministic' or 'robust'
 SETTING = 'deterministic'
 
-# Robust evaluation: structured-array .npy with fields b1/q1/b2/q2/
-# inflow_seed1/inflow_seed2/Pcrit1/Pcrit2 (shape (1000,)).
 EVAL_SCENARIOS_PATH = '../lakes/lake_scenarios_eval.npy'
-
-# Deterministic evaluation: which entry of params_config.lake_reference_scenarios
-# to use when the archive's reference_scenario column says ref_num. For MORL,
-# no such column exists — we evaluate at default_lake_scenario instead.
 
 run_scoring = {'pareto': 1, 'indicator': 1, 'decomposition': 1}
 run_scenario_method_for_setting = {
@@ -38,13 +32,6 @@ run_scenario_method_for_setting = {
     'robust': ['multi', 'moro'],
 }
 run_n_obj = {2: 1, 6: 1}
-
-# Cap on archive size per agent. Larger archives are subsampled by
-# crowding distance (via PQL._subsample_nd) BEFORE rollouts — this
-# avoids wasted env replay on policies we'd drop. Set to None to
-# disable subsampling. Recommended: 1000 for robust runs where multi
-# pools 5 agents (5000 total before ND).
-MAX_POLICIES_PER_AGENT = 500
 
 # Parallelism: 0 = auto (os.cpu_count()), 1 = serial (debug), N>0 = N workers
 N_WORKERS = 0
@@ -249,57 +236,9 @@ def _evaluate_agent(agent, scenarios, n_obj):
 
 
 # ----------------------------------------------------------------------
-# ND filter (MIN-conv input)
-# ----------------------------------------------------------------------
-def _nd_filter_min(values):
-    arr = np.asarray(values, dtype=float)
-    if arr.shape[0] <= 1:
-        return np.ones(arr.shape[0], dtype=bool)
-    if _moo_is_nd is not None:
-        return _moo_is_nd(arr)
-    n = arr.shape[0]
-    keep = np.ones(n, dtype=bool)
-    for i in range(n):
-        if not keep[i]:
-            continue
-        for j in range(n):
-            if i == j or not keep[j]:
-                continue
-            if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
-                keep[i] = False
-                break
-    return keep
-
-
-# ----------------------------------------------------------------------
 # HV machinery — IDENTICAL to lake_moea_reeval.py to guarantee
 # bit-for-bit comparable HV between MOEA and MORL given the same box.
 # ----------------------------------------------------------------------
-from moocore import hypervolume as _exact_hv
-
-MC_SAMPLES_6OBJ = 50_000
-MC_SEED = 12345
-
-
-def _hv_exact(front_max, ref_min):
-    if len(front_max) == 0:
-        return 0.0
-    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
-
-
-def _hv_mc(front_max, lo, hi, samples):
-    if len(front_max) == 0:
-        return 0.0
-    F = np.ascontiguousarray(front_max, float)
-    N = samples.shape[0]
-    dom = np.zeros(N, dtype=bool)
-    blk = 2000
-    for i in range(0, N, blk):
-        S = samples[i:i + blk]
-        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
-    return float(dom.mean() * np.prod(hi - lo))
-
-
 def _fixed_box(n_obj):
     if SETTING == 'deterministic':
         from params_config import (lake_box_deterministic_dim2,
@@ -331,7 +270,7 @@ def _panel_machinery(cells, n_obj):
         hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
         meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
                     mc_seed=MC_SEED)
-    union = np.vstack([c[-1] for c in cells])
+    union = np.vstack([c[4] for c in cells])  # c[4] is front_max
     best_known_hv = hv(union)
     meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
                 box_volume=box_volume, best_known_hv=best_known_hv,
@@ -369,6 +308,7 @@ def _process_one_seed(task):
 
     all_targets, all_means, all_ref = [], [], []
     diag_lines = []
+    corr_values = []
     for fpath, ref_num in agent_files:
         agent = _load_agent(fpath, n_obj=n_obj)
         if int(agent.num_objectives) != n_obj:
@@ -377,6 +317,9 @@ def _process_one_seed(task):
                 f'{agent.num_objectives} != folder n_obj {n_obj}')
         targets, means_pos, diag = _evaluate_agent(
             agent, scenarios, n_obj)
+
+        if not np.isnan(diag['mean_corr']):
+            corr_values.append(float(diag['mean_corr']))
 
         ref_tag = f' ref{ref_num}' if ref_num is not None else ''
         corr_str = ('nan' if np.isnan(diag['mean_corr'])
@@ -414,12 +357,27 @@ def _process_one_seed(task):
     os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
     df_out.to_csv(out_csv_seed, index=False)
 
+    cell_mean_corr = (float(np.mean(corr_values))
+                      if corr_values else float('nan'))
+    n_total_pol = int(len(means_min))
+    n_dom = int((~keep).sum())
+
+    # Sidecar JSON with per-cell aggregates so a future rerun with this
+    # seed's CSV checkpoint still recovers the diagnostic columns.
+    side = out_csv_seed.replace('.csv', '_meta.json')
+    with open(side, 'w') as f:
+        json.dump({'n_agents': len(agent_files),
+                   'n_total_pol': n_total_pol,
+                   'n_dom': n_dom,
+                   'mean_corr': cell_mean_corr}, f)
+
     return {**meta, 'seed': k,
             'front_min': means_min_k,
             'rows': len(df_out),
             'n_agents': len(agent_files),
-            'n_total_pol': len(means_min),
-            'n_dom': int((~keep).sum()),
+            'n_total_pol': n_total_pol,
+            'n_dom': n_dom,
+            'mean_corr': cell_mean_corr,
             'dt': time.time() - t0,
             'diag': '; '.join(diag_lines),
             'note': 'computed'}
@@ -428,11 +386,6 @@ def _process_one_seed(task):
 # ----------------------------------------------------------------------
 # Discovery + task planning
 # ----------------------------------------------------------------------
-def _seed_idx(p):
-    m = re.search(r'seed(\d+)', p)
-    return int(m.group(1)) if m else -1
-
-
 def _enabled_stems():
     """yield (scoring, scenm, n_obj, stem_dir)"""
     morl_base = os.path.join(INPUT_ROOT, SETTING, 'morl')
@@ -456,7 +409,8 @@ def _enabled_stems():
 
 def _build_tasks(reeval_root):
     tasks = []
-    prebuilt_cells = []  # (scoring, scenm, n_obj, seed, F_min)
+    prebuilt_cells = []  # (scoring, scenm, n_obj, seed, F_min,
+    #  n_total_pol, n_dom, mean_corr)
     skipped = 0
     for scoring, scenm, n_obj, stem_dir in _enabled_stems():
         stem_name = os.path.basename(stem_dir)
@@ -474,8 +428,22 @@ def _build_tasks(reeval_root):
                            if re.fullmatch(r're_o\d+', c)]
                 if re_cols:
                     F_min = prev[re_cols].values
+                    side = out_csv_seed.replace('.csv', '_meta.json')
+                    n_tot = n_dm = -1
+                    mc = float('nan')
+                    if os.path.exists(side):
+                        try:
+                            with open(side) as sf:
+                                sd_meta = json.load(sf)
+                            n_tot = int(sd_meta.get('n_total_pol', -1))
+                            n_dm = int(sd_meta.get('n_dom', -1))
+                            mc = float(sd_meta.get('mean_corr',
+                                                   float('nan')))
+                        except Exception:
+                            pass
                     prebuilt_cells.append(
-                        (scoring, scenm, n_obj, k, F_min))
+                        (scoring, scenm, n_obj, k, F_min,
+                         n_tot, n_dm, mc))
                     skipped += 1
                     continue
 
@@ -542,7 +510,9 @@ if __name__ == '__main__':
                 if res.get('front_min') is not None:
                     cells.append((res['scoring'], res['scenm'],
                                   res['n_obj'], res['seed'],
-                                  res['front_min']))
+                                  res['front_min'],
+                                  res['n_total_pol'], res['n_dom'],
+                                  res['mean_corr']))
                 _log_line(i, len(tasks), res)
         else:
             with ProcessPoolExecutor(
@@ -555,7 +525,9 @@ if __name__ == '__main__':
                     if res.get('front_min') is not None:
                         cells.append((res['scoring'], res['scenm'],
                                       res['n_obj'], res['seed'],
-                                      res['front_min']))
+                                      res['front_min'],
+                                      res['n_total_pol'], res['n_dom'],
+                                      res['mean_corr']))
                     _log_line(i, len(tasks), res)
 
     print(f'\n   MORL re-evaluation done in {time.time() - t0_all:.1f}s')
@@ -565,8 +537,8 @@ if __name__ == '__main__':
         raise SystemExit('no MORL cells available — nothing to score')
 
     print('\n=== Computing HV on re-evaluated MORL fronts ===')
-    panel_cells_max = [(sc, scen, n, k, -F_min)
-                       for sc, scen, n, k, F_min in cells]
+    panel_cells_max = [(sc, scen, n, k, -F_min, n_tot, n_dm, mc)
+                       for sc, scen, n, k, F_min, n_tot, n_dm, mc in cells]
     by_nobj = defaultdict(list)
     for c in panel_cells_max:
         by_nobj[c[2]].append(c)
@@ -584,19 +556,27 @@ if __name__ == '__main__':
     for n_obj, pcells in sorted(by_nobj.items()):
         hv, box_volume, pmeta = _panel_machinery(pcells, n_obj)
         meta['panels'][str(n_obj)] = pmeta
+        nadir = np.asarray(pmeta['box_nadir'], dtype=float)
+        ideal = np.asarray(pmeta['box_ideal'], dtype=float)
         print(f'\n n_obj={n_obj}: {len(pcells)} re-evaluated cells, '
               f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
               f"best-known HV={pmeta['best_known_hv']:.5g} "
               f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
-        for scoring, scenm, no, k, F in pcells:
+        for scoring, scenm, no, k, F, n_tot, n_dm, mc in pcells:
             h = hv(F)
+            s = _spacing_norm(F, nadir, ideal)
             cond = f'closed_loop_{scenm}'
             rows.append(dict(
                 paradigm='MORL', method=scoring, condition=cond,
                 scoring=scoring, scenario_method=scenm,
-                n_obj=no, seed=k, n_solutions=int(len(F)),
+                n_obj=no, seed=k,
+                n_total_pol=int(n_tot) if n_tot >= 0 else np.nan,
+                n_dom=int(n_dm) if n_dm >= 0 else np.nan,
+                n_solutions=int(len(F)),
+                mean_corr=float(mc),
                 hv=h, box_volume=box_volume,
-                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
+                hv_ratio=(h / box_volume if box_volume > 0 else np.nan),
+                spacing_norm=s))
         agg = defaultdict(list)
         for r in rows:
             if r['n_obj'] == n_obj:

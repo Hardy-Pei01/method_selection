@@ -57,7 +57,7 @@ def run_moea(model, params, file_end, start_time, problem):
     num_obj = sum(1 for o in model.outcomes if o.kind != ScalarOutcome.INFO)
     robustness_functions = build_robustness_functions(num_obj)
 
-    with MultiprocessingEvaluator(model, n_processes=-2) as evaluator:
+    with MultiprocessingEvaluator(model, n_processes=32) as evaluator:
         arch, conv = evaluator.robust_optimize(
             robustness_functions,
             scenarios,

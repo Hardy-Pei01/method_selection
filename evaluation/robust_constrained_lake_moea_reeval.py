@@ -3,13 +3,15 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from moocore import hypervolume as _exact_hv
-from moocore import is_nondominated as _moo_is_nd
-
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from constrained_two_lake import ConstrainedTwoLakeEnv
+
+from utils import (
+    MC_SAMPLES_6OBJ, MC_SEED, _hv_exact, _hv_mc,
+    _nd_filter_max, _seed_idx, _spacing_norm,
+)
 
 # ----------------------------------------------------------------------
 # Experiment scope
@@ -25,15 +27,18 @@ run_policy = {'intertemporal': 1, 'dps': 1}
 run_scenario_method = {'multi': 1, 'moro': 1}
 run_n_obj = {2: 1, 6: 1}
 
-MC_SAMPLES_6OBJ = 50_000
-MC_SEED = 12345
 
 N_WORKERS = 0
 
-# Stem-folder pattern (mirrors robust_lake_moea_reeval.py): seeds are
-# subdirectories `seed*/` inside each stem.
 FOLDER_RE = re.compile(
     r'^(intertemporal|dps)_(NSGAII|IBEA|MOEAD)_(multi|moro)_(\d+)$')
+
+# Tolerant mode: a policy passes if it is feasible (info['feasible']==True
+# at episode end) in at least this fraction of eval scenarios. Strict mode
+# requires 100% feasibility. The 80% threshold mirrors the 20th-percentile
+# robustness criterion used during training: a policy that violates in up
+# to 20% of scenarios still has its 20th-percentile fitness untouched.
+FEASIBILITY_THRESHOLD = 0.80
 
 # ----------------------------------------------------------------------
 # Worker-global state
@@ -78,9 +83,7 @@ def _load_eval_scenarios(path):
 
 
 # ----------------------------------------------------------------------
-# Policy rollouts (MAX-conv, includes penalty applied inside env).
-# Each rollout returns (total_reward, feasible) where feasible is
-# info['feasible'] at episode end.
+# Policy rollouts (MAX-conv, with feasibility tracking)
 # ----------------------------------------------------------------------
 def _rollout_intertemporal(env, decisions_u1, decisions_u2):
     env.reset()
@@ -117,20 +120,21 @@ def _rollout_dps(env, c1_1, c2_1, r1_1, r2_1, w1_1,
 
 def _eval_policy_on_scenarios(row, policy_kind, scenarios, n_obj,
                               u1_keys=None, u2_keys=None):
-    """Evaluate one policy across all scenarios. Short-circuits on the
-    first violating scenario. Returns (mean_reward_MAX_conv, feasible).
-    If feasible is False, mean_reward is undefined and should not be used."""
-    sums = np.zeros(n_obj, dtype=np.float64)
+    """Roll one policy across EVERY scenario. Returns:
+      returns    : (n_scen, n_obj) per-scenario MAX-conv returns
+      feas_flags : (n_scen,) bool — info['feasible'] at episode end
+    No short-circuit — callers apply strict/tolerant filtering."""
     n = len(scenarios)
+    returns = np.empty((n, n_obj), dtype=np.float64)
+    feas_flags = np.zeros(n, dtype=bool)
     if policy_kind == 'intertemporal':
         u1 = [int(row[c]) for c in u1_keys]
         u2 = [int(row[c]) for c in u2_keys]
-        for s in scenarios:
+        for i, s in enumerate(scenarios):
             env = _build_env(s, n_obj)
             ret, feas = _rollout_intertemporal(env, u1, u2)
-            if not feas:
-                return None, False  # short-circuit
-            sums += ret
+            returns[i] = ret
+            feas_flags[i] = feas
     elif policy_kind == 'dps':
         c1_1, c2_1 = float(row['c1_1']), float(row['c2_1'])
         r1_1, r2_1 = float(row['r1_1']), float(row['r2_1'])
@@ -138,31 +142,36 @@ def _eval_policy_on_scenarios(row, policy_kind, scenarios, n_obj,
         c1_2, c2_2 = float(row['c1_2']), float(row['c2_2'])
         r1_2, r2_2 = float(row['r1_2']), float(row['r2_2'])
         w1_2 = float(row['w1_2'])
-        for s in scenarios:
+        for i, s in enumerate(scenarios):
             env = _build_env(s, n_obj)
             ret, feas = _rollout_dps(env, c1_1, c2_1, r1_1, r2_1, w1_1,
                                      c1_2, c2_2, r1_2, r2_2, w1_2)
-            if not feas:
-                return None, False  # short-circuit
-            sums += ret
+            returns[i] = ret
+            feas_flags[i] = feas
     else:
         raise ValueError(f'unknown policy_kind {policy_kind!r}')
-    return sums / n, True
+    return returns, feas_flags
 
 
 def _reevaluate_archive(archive_path, policy_kind, n_obj, scenarios):
-    """Returns (front_min_feasible, n_evaluated, n_infeasible).
-       front_min_feasible: (n_feas, n_obj) realised mean returns in
-                           MIN-conv, restricted to feasible policies.
-       n_evaluated:        rows in this archive.
-       n_infeasible:       policies dropped because at least one
-                           scenario produced a violation.
-    The constrained env's reward already includes the violation
-    penalty; we discard infeasible policies rather than scoring them."""
+    """Build two per-archive fronts (MIN-conv) and per-mode counts.
+
+    Strict mode: keep policies with feas_rate == 1.0; mean over all
+    scenarios.
+    Tolerant mode: keep policies with feas_rate >= FEASIBILITY_THRESHOLD;
+    mean over feasible scenarios only (avoids double-punishment via
+    the env's violation penalty).
+    """
     df = pd.read_csv(archive_path)
     n_pol = len(df)
     if n_pol == 0:
-        return np.empty((0, n_obj)), 0, 0
+        return {
+            'strict_min': np.empty((0, n_obj)),
+            'tolerant_min': np.empty((0, n_obj)),
+            'n_evaluated': 0,
+            'n_infeasible_strict': 0,
+            'n_infeasible_tolerant': 0,
+        }
     u1_keys = u2_keys = None
     if policy_kind == 'intertemporal':
         u1_keys = sorted(
@@ -171,26 +180,36 @@ def _reevaluate_archive(archive_path, policy_kind, n_obj, scenarios):
         u2_keys = sorted(
             [c for c in df.columns if re.fullmatch(r'u2_\d+', c)],
             key=lambda c: int(re.search(r'\d+', c).group()))
-    out_feas = []
-    n_infeasible = 0
+
+    strict_rows = []
+    tolerant_rows = []
+    n_inf_strict = 0
+    n_inf_tolerant = 0
     for _, row in df.iterrows():
-        mean_pos, feasible = _eval_policy_on_scenarios(
+        returns, feas_flags = _eval_policy_on_scenarios(
             row, policy_kind, scenarios, n_obj,
             u1_keys=u1_keys, u2_keys=u2_keys)
-        if feasible:
-            out_feas.append(-mean_pos)  # MAX-conv → MIN-conv
+        feas_rate = float(feas_flags.mean())
+
+        if feas_rate >= 1.0 - 1e-12:
+            strict_rows.append(-returns.mean(axis=0))
         else:
-            n_infeasible += 1
-    if not out_feas:
-        return np.empty((0, n_obj)), n_pol, n_infeasible
-    return np.vstack(out_feas), n_pol, n_infeasible
+            n_inf_strict += 1
 
+        if feas_rate >= FEASIBILITY_THRESHOLD - 1e-12:
+            tolerant_rows.append(-returns[feas_flags].mean(axis=0))
+        else:
+            n_inf_tolerant += 1
 
-def _nd_filter_max(F_max):
-    if len(F_max) <= 1:
-        return F_max
-    mask = _moo_is_nd(-F_max)
-    return F_max[mask]
+    return {
+        'strict_min': (np.vstack(strict_rows) if strict_rows
+                       else np.empty((0, n_obj))),
+        'tolerant_min': (np.vstack(tolerant_rows) if tolerant_rows
+                         else np.empty((0, n_obj))),
+        'n_evaluated': n_pol,
+        'n_infeasible_strict': n_inf_strict,
+        'n_infeasible_tolerant': n_inf_tolerant,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -202,7 +221,9 @@ def _process_one_cell(task):
     policy_kind = task['policy']
     scenm = task['scenm']
     n_obj = task['n_obj']
-    out_csv_seed = task['out_csv_seed']
+    out_csv_strict = task['out_csv_strict']
+    out_csv_tolerant = task['out_csv_tolerant']
+    out_meta = task['out_meta']
     meta = task['meta']
     scenarios = _EVAL_SCENARIOS
 
@@ -211,98 +232,82 @@ def _process_one_cell(task):
         f for f in glob.glob(os.path.join(sd_dir, 'archives_*.csv'))
         if not f.endswith('_evaluated.csv'))
     if not archives:
-        return {**meta, 'seed': k, 'front_max': None,
+        return {**meta, 'seed': k, 'F_strict': None, 'F_tolerant': None,
                 'dt': 0.0, 'note': 'no archive files'}
 
-    per_archive_min = []
+    per_arch_strict = []
+    per_arch_tolerant = []
     n_evaluated_cell = 0
-    n_infeasible_cell = 0
+    n_inf_strict_cell = 0
+    n_inf_tolerant_cell = 0
     for archpath in archives:
-        arr, n_eval, n_infeas = _reevaluate_archive(
-            archpath, policy_kind, n_obj, scenarios)
-        per_archive_min.append(arr)
-        n_evaluated_cell += n_eval
-        n_infeasible_cell += n_infeas
+        r = _reevaluate_archive(archpath, policy_kind, n_obj, scenarios)
+        per_arch_strict.append(r['strict_min'])
+        per_arch_tolerant.append(r['tolerant_min'])
+        n_evaluated_cell += r['n_evaluated']
+        n_inf_strict_cell += r['n_infeasible_strict']
+        n_inf_tolerant_cell += r['n_infeasible_tolerant']
 
-    n_feas_pol = sum(len(a) for a in per_archive_min)
+    # Aggregate per-archive fronts according to scenm. For 'multi', we
+    # pool all archives; for 'moro', we keep only the first (the policy
+    # families that emerged from per-scenario optimisation runs).
+    def _aggregate(per_arch):
+        if scenm == 'multi':
+            return np.vstack(per_arch) if per_arch else np.empty((0, n_obj))
+        return per_arch[0] if per_arch else np.empty((0, n_obj))
 
-    # If every policy was infeasible (or no archive parsed), still
-    # write a sidecar so checkpoint reload picks up the counts.
-    if not per_archive_min or n_feas_pol == 0:
-        os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
-        pd.DataFrame(
-            np.empty((0, n_obj)),
-            columns=[f're_o{j + 1}' for j in range(n_obj)]
-        ).to_csv(out_csv_seed, index=False)
-        side = out_csv_seed.replace('.csv', '_meta.json')
-        with open(side, 'w') as f:
-            json.dump({'n_evaluated': n_evaluated_cell,
-                       'n_infeasible': n_infeasible_cell}, f)
-        return {**meta, 'seed': k,
-                'front_max': np.empty((0, n_obj)),
-                'dt': time.time() - t0,
-                'n_archives': len(archives),
-                'n_total_pol': 0,
-                'n_dom': 0,
-                'n_evaluated': n_evaluated_cell,
-                'n_infeasible': n_infeasible_cell,
-                'note': 'computed (all infeasible)'}
+    agg_strict_min = _aggregate(per_arch_strict)
+    agg_tolerant_min = _aggregate(per_arch_tolerant)
 
-    if scenm == 'multi':
-        pooled_min = np.vstack(per_archive_min)
-        front_max = _nd_filter_max(-pooled_min)
-    else:
-        front_max = _nd_filter_max(-per_archive_min[0])
+    n_total_strict = int(len(agg_strict_min))
+    n_total_tolerant = int(len(agg_tolerant_min))
 
-    os.makedirs(os.path.dirname(out_csv_seed), exist_ok=True)
-    # Write front in MIN-conv (convention shared with the MORL scripts:
-    # `re_o*` columns are MIN-conv; reload negates back to MAX-conv).
-    pd.DataFrame(
-        -front_max, columns=[f're_o{j + 1}' for j in range(n_obj)]
-    ).to_csv(out_csv_seed, index=False)
+    F_strict = (_nd_filter_max(-agg_strict_min) if n_total_strict
+                else np.empty((0, n_obj)))
+    F_tolerant = (_nd_filter_max(-agg_tolerant_min) if n_total_tolerant
+                  else np.empty((0, n_obj)))
 
-    # Sidecar with per-cell feasibility counts (the per-seed CSV holds
-    # only the ND front of feasible policies, so counts would be lost).
-    side = out_csv_seed.replace('.csv', '_meta.json')
-    with open(side, 'w') as f:
-        json.dump({'n_evaluated': n_evaluated_cell,
-                   'n_infeasible': n_infeasible_cell}, f)
+    n_dom_strict = n_total_strict - int(len(F_strict))
+    n_dom_tolerant = n_total_tolerant - int(len(F_tolerant))
 
-    return {**meta, 'seed': k, 'front_max': front_max,
-            'dt': time.time() - t0,
+    # Two CSVs + one sidecar.
+    os.makedirs(os.path.dirname(out_csv_strict), exist_ok=True)
+    cols = [f're_o{j + 1}' for j in range(n_obj)]
+    pd.DataFrame(-F_strict, columns=cols).to_csv(out_csv_strict, index=False)
+    pd.DataFrame(-F_tolerant, columns=cols).to_csv(out_csv_tolerant, index=False)
+
+    with open(out_meta, 'w') as f:
+        json.dump({
             'n_archives': len(archives),
-            'n_total_pol': n_feas_pol,
-            'n_dom': n_feas_pol - len(front_max),
-            'n_evaluated': n_evaluated_cell,
-            'n_infeasible': n_infeasible_cell,
-            'note': 'computed'}
+            'n_total_pol_strict': n_total_strict,
+            'n_total_pol_tolerant': n_total_tolerant,
+            'n_evaluated': int(n_evaluated_cell),
+            'n_infeasible_strict': int(n_inf_strict_cell),
+            'n_infeasible_tolerant': int(n_inf_tolerant_cell),
+            'n_dom_strict': int(n_dom_strict),
+            'n_dom_tolerant': int(n_dom_tolerant),
+            'feasibility_threshold': FEASIBILITY_THRESHOLD,
+            'scenm': scenm,
+        }, f)
+
+    return {**meta, 'seed': k,
+            'F_strict': F_strict, 'F_tolerant': F_tolerant,
+            'n_archives': len(archives),
+            'n_total_pol_strict': n_total_strict,
+            'n_total_pol_tolerant': n_total_tolerant,
+            'n_evaluated': int(n_evaluated_cell),
+            'n_infeasible_strict': int(n_inf_strict_cell),
+            'n_infeasible_tolerant': int(n_inf_tolerant_cell),
+            'n_dom_strict': int(n_dom_strict),
+            'n_dom_tolerant': int(n_dom_tolerant),
+            'dt': time.time() - t0, 'note': 'computed'}
 
 
 # ----------------------------------------------------------------------
-# HV machinery
+# HV machinery — mode-independent setup + per-mode best-known.
 # ----------------------------------------------------------------------
-def _hv_exact(front_max, ref_min):
-    if len(front_max) == 0:
-        return 0.0
-    return float(_exact_hv(-np.asarray(front_max, float), ref=ref_min))
-
-
-def _hv_mc(front_max, lo, hi, samples):
-    if len(front_max) == 0:
-        return 0.0
-    F = np.ascontiguousarray(front_max, float)
-    N = samples.shape[0]
-    dom = np.zeros(N, dtype=bool)
-    blk = 2000
-    for i in range(0, N, blk):
-        S = samples[i:i + blk]
-        dom[i:i + blk] = (F[None, :, :] >= S[:, None, :]).all(axis=2).any(axis=1)
-    return float(dom.mean() * np.prod(hi - lo))
-
-
 def _fixed_box(n_obj):
-    from params_config import (lake_box_robust_dim2,
-                               lake_box_robust_dim6)
+    from params_config import (lake_box_robust_dim2, lake_box_robust_dim6)
     box = {2: lake_box_robust_dim2,
            6: lake_box_robust_dim6}[n_obj]
     nadir = np.asarray(box['nadir'], dtype=float)
@@ -312,35 +317,36 @@ def _fixed_box(n_obj):
     return nadir, ideal
 
 
-def _panel_machinery(cells, n_obj):
+def _panel_setup(n_obj):
     nadir, ideal = _fixed_box(n_obj)
     box_volume = float(np.prod(ideal - nadir))
     if n_obj == 2:
         ref_min = -nadir
         hv = lambda F: _hv_exact(np.clip(F, nadir, ideal), ref_min)
-        meta = dict(estimator='exact')
+        pmeta = dict(estimator='exact')
     else:
         rng = np.random.default_rng(MC_SEED)
         samples = rng.uniform(nadir, ideal, size=(MC_SAMPLES_6OBJ, n_obj))
         hv = lambda F: _hv_mc(np.clip(F, nadir, ideal), nadir, ideal, samples)
-        meta = dict(estimator='monte_carlo', mc_samples=MC_SAMPLES_6OBJ,
-                    mc_seed=MC_SEED)
-    union = np.vstack([c[5] for c in cells]) if cells else np.empty((0, n_obj))
-    best_known_hv = hv(union) if len(union) else 0.0
-    meta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
-                box_volume=box_volume, best_known_hv=best_known_hv,
-                n_union_points=int(len(union)))
-    return hv, box_volume, meta
+        pmeta = dict(estimator='monte_carlo',
+                     mc_samples=MC_SAMPLES_6OBJ, mc_seed=MC_SEED)
+    pmeta.update(box_nadir=nadir.tolist(), box_ideal=ideal.tolist(),
+                 box_volume=box_volume)
+    return hv, box_volume, nadir, ideal, pmeta
+
+
+def _best_known(panel_cells, hv, mode):
+    key = f'F_{mode}'
+    fronts = [c[key] for c in panel_cells if len(c[key]) > 0]
+    if not fronts:
+        return 0.0, 0
+    union = np.vstack(fronts)
+    return hv(union), int(len(union))
 
 
 # ----------------------------------------------------------------------
 # Discovery + task planning
 # ----------------------------------------------------------------------
-def _seed_idx(p):
-    m = re.search(r'seed(\d+)', p)
-    return int(m.group(1)) if m else -1
-
-
 def _enabled_stems():
     moea_base = os.path.join(INPUT_ROOT, SETTING, 'moea')
     if not os.path.isdir(moea_base):
@@ -358,40 +364,56 @@ def _enabled_stems():
         yield algo, policy, scenm, n_obj, os.path.join(moea_base, d)
 
 
+def _load_sidecar(out_meta):
+    if not os.path.exists(out_meta):
+        return {}
+    try:
+        with open(out_meta) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _build_tasks(reeval_root):
     tasks = []
     prebuilt_cells = []
     skipped = 0
-
     for algo, policy, scenm, n_obj, stem_dir in _enabled_stems():
         stem_name = os.path.basename(stem_dir)
+        cfg_out_dir = os.path.join(reeval_root, stem_name)
         seeds = sorted(glob.glob(os.path.join(stem_dir, 'seed*')))
         for sd_dir in seeds:
-            if not os.path.isdir(sd_dir):
-                continue
             k = _seed_idx(sd_dir)
-            out_csv_seed = os.path.join(reeval_root, stem_name, f'seed{k}.csv')
+            out_csv_strict = os.path.join(cfg_out_dir, f'seed{k}_strict.csv')
+            out_csv_tolerant = os.path.join(cfg_out_dir, f'seed{k}_tolerant.csv')
+            out_meta = os.path.join(cfg_out_dir, f'seed{k}_meta.json')
 
-            if os.path.exists(out_csv_seed):
-                prev = pd.read_csv(out_csv_seed)
-                rec = [c for c in prev.columns
-                       if re.fullmatch(r're_o\d+', c)]
-                if rec:
-                    F_min = prev[rec].values
-                    side = out_csv_seed.replace('.csv', '_meta.json')
-                    n_eval = 0
-                    n_infeas = 0
-                    if os.path.exists(side):
-                        try:
-                            with open(side) as f:
-                                sd_meta = json.load(f)
-                            n_eval = int(sd_meta.get('n_evaluated', 0))
-                            n_infeas = int(sd_meta.get('n_infeasible', 0))
-                        except Exception:
-                            pass
-                    prebuilt_cells.append(
-                        (algo, policy, scenm, n_obj, k, -F_min,
-                         n_eval, n_infeas))
+            if (os.path.exists(out_csv_strict)
+                    and os.path.exists(out_csv_tolerant)):
+                prev_s = pd.read_csv(out_csv_strict)
+                prev_t = pd.read_csv(out_csv_tolerant)
+                rec_s = [c for c in prev_s.columns
+                         if re.fullmatch(r're_o\d+', c)]
+                rec_t = [c for c in prev_t.columns
+                         if re.fullmatch(r're_o\d+', c)]
+                if rec_s and rec_t:
+                    F_strict = -prev_s[rec_s].values
+                    F_tolerant = -prev_t[rec_t].values
+                    sd_meta = _load_sidecar(out_meta)
+                    cell = {
+                        'algo': algo, 'policy': policy, 'scenm': scenm,
+                        'n_obj': n_obj, 'seed': k,
+                        'F_strict': F_strict, 'F_tolerant': F_tolerant,
+                        'n_archives':            int(sd_meta.get('n_archives', -1)),
+                        'n_total_pol_strict':    int(sd_meta.get('n_total_pol_strict', -1)),
+                        'n_total_pol_tolerant':  int(sd_meta.get('n_total_pol_tolerant', -1)),
+                        'n_evaluated':           int(sd_meta.get('n_evaluated', 0)),
+                        'n_infeasible_strict':   int(sd_meta.get('n_infeasible_strict', -1)),
+                        'n_infeasible_tolerant': int(sd_meta.get('n_infeasible_tolerant', -1)),
+                        'n_dom_strict':          int(sd_meta.get('n_dom_strict', -1)),
+                        'n_dom_tolerant':        int(sd_meta.get('n_dom_tolerant', -1)),
+                    }
+                    prebuilt_cells.append(cell)
                     skipped += 1
                     continue
 
@@ -401,7 +423,9 @@ def _build_tasks(reeval_root):
                 'policy': policy,
                 'scenm': scenm,
                 'n_obj': n_obj,
-                'out_csv_seed': out_csv_seed,
+                'out_csv_strict': out_csv_strict,
+                'out_csv_tolerant': out_csv_tolerant,
+                'out_meta': out_meta,
                 'meta': {'algo': algo, 'policy': policy,
                          'scenm': scenm, 'n_obj': n_obj},
             })
@@ -412,9 +436,14 @@ def _build_tasks(reeval_root):
 # Main
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
+    print('=' * 64)
+    print(f'EVALUATING setting = {SETTING} (constrained_lake, MOEA — env replay)')
+    print('=' * 64)
+
     eval_scenarios = _load_eval_scenarios(EVAL_SCENARIOS_PATH)
-    print(f'loaded {len(eval_scenarios)} evaluation scenarios '
-          f'from {EVAL_SCENARIOS_PATH}')
+    print(f'loaded {len(eval_scenarios)} eval scenarios from '
+          f'{EVAL_SCENARIOS_PATH}')
+    print(f'FEASIBILITY_THRESHOLD={FEASIBILITY_THRESHOLD}')
 
     out_root = os.path.join(OUTPUT_ROOT, SETTING, 'moea')
     reeval_root = os.path.join(out_root, 'reeval_archives')
@@ -425,9 +454,44 @@ if __name__ == '__main__':
     n_workers = (os.cpu_count() if N_WORKERS == 0 else N_WORKERS) or 1
     n_workers = min(n_workers, max(1, len(tasks)))
 
-    print(f'\n=== Re-evaluating archives (constrained_lake, {SETTING}) ===')
+    print(f'\n=== Re-evaluating archives ({SETTING}) ===')
     print(f'   {n_total} cells total; {skipped} already checkpointed, '
           f'{len(tasks)} to compute with {n_workers} worker(s)')
+
+    def _record(res):
+        if res.get('F_strict') is None:
+            return
+        cells.append({
+            'algo': res['algo'], 'policy': res['policy'],
+            'scenm': res['scenm'], 'n_obj': res['n_obj'],
+            'seed': res['seed'],
+            'F_strict': res['F_strict'], 'F_tolerant': res['F_tolerant'],
+            'n_archives':            res['n_archives'],
+            'n_total_pol_strict':    res['n_total_pol_strict'],
+            'n_total_pol_tolerant':  res['n_total_pol_tolerant'],
+            'n_evaluated':           res['n_evaluated'],
+            'n_infeasible_strict':   res['n_infeasible_strict'],
+            'n_infeasible_tolerant': res['n_infeasible_tolerant'],
+            'n_dom_strict':          res['n_dom_strict'],
+            'n_dom_tolerant':        res['n_dom_tolerant'],
+        })
+
+    def _print_log(i, n_tasks, res):
+        lbl = (f"{res['policy']}_{res['algo']}_{res['scenm']}_"
+               f"{res['n_obj']}/seed{res['seed']}")
+        if res.get('note') == 'computed':
+            print(f"   [{i:3d}/{n_tasks}] {lbl:50s} "
+                  f"{res['dt']:6.1f}s  {res['n_archives']} arch; "
+                  f"strict {res['n_total_pol_strict']}"
+                  f"→{len(res['F_strict'])} "
+                  f"(infeas={res['n_infeasible_strict']}, "
+                  f"dom={res['n_dom_strict']});  "
+                  f"tolerant {res['n_total_pol_tolerant']}"
+                  f"→{len(res['F_tolerant'])} "
+                  f"(infeas={res['n_infeasible_tolerant']}, "
+                  f"dom={res['n_dom_tolerant']})")
+        else:
+            print(f"   [{i:3d}/{n_tasks}] {lbl:50s}  {res['note']}")
 
     t0_all = time.time()
     if tasks:
@@ -435,23 +499,8 @@ if __name__ == '__main__':
             _worker_init(eval_scenarios)
             for i, task in enumerate(tasks, 1):
                 res = _process_one_cell(task)
-                if res.get('front_max') is not None:
-                    cells.append((res['algo'], res['policy'],
-                                  res['scenm'], res['n_obj'],
-                                  res['seed'], res['front_max'],
-                                  res.get('n_evaluated', 0),
-                                  res.get('n_infeasible', 0)))
-                lbl = (f"{res['policy']}_{res['algo']}_{res['scenm']}_"
-                       f"{res['n_obj']}/seed{res['seed']}")
-                if res.get('note', '').startswith('computed'):
-                    infeas_str = (f", {res['n_infeasible']} infeas"
-                                  if res.get('n_infeasible', 0) else '')
-                    print(f"   [{i:3d}/{len(tasks)}] {lbl:50s} "
-                          f"{res['dt']:6.1f}s  {res['n_archives']} arch, "
-                          f"{res['n_total_pol']}→{len(res['front_max'])} pols "
-                          f"({res['n_dom']} dom{infeas_str})")
-                else:
-                    print(f"   [{i:3d}/{len(tasks)}] {lbl:50s}  {res['note']}")
+                _record(res)
+                _print_log(i, len(tasks), res)
         else:
             with ProcessPoolExecutor(
                     max_workers=n_workers,
@@ -461,23 +510,8 @@ if __name__ == '__main__':
                            for t in tasks}
                 for i, fut in enumerate(as_completed(futures), 1):
                     res = fut.result()
-                    if res.get('front_max') is not None:
-                        cells.append((res['algo'], res['policy'],
-                                      res['scenm'], res['n_obj'],
-                                      res['seed'], res['front_max'],
-                                      res.get('n_evaluated', 0),
-                                      res.get('n_infeasible', 0)))
-                    lbl = (f"{res['policy']}_{res['algo']}_{res['scenm']}_"
-                           f"{res['n_obj']}/seed{res['seed']}")
-                    if res.get('note', '').startswith('computed'):
-                        infeas_str = (f", {res['n_infeasible']} infeas"
-                                      if res.get('n_infeasible', 0) else '')
-                        print(f"   [{i:3d}/{len(tasks)}] {lbl:50s} "
-                              f"{res['dt']:6.1f}s  {res['n_archives']} arch, "
-                              f"{res['n_total_pol']}→{len(res['front_max'])} pols "
-                              f"({res['n_dom']} dom{infeas_str})")
-                    else:
-                        print(f"   [{i:3d}/{len(tasks)}] {lbl:50s}  {res['note']}")
+                    _record(res)
+                    _print_log(i, len(tasks), res)
 
     print(f'\n   re-evaluation phase done in {time.time() - t0_all:.1f}s')
 
@@ -487,56 +521,109 @@ if __name__ == '__main__':
     print('\n=== Computing HV on re-evaluated fronts ===')
     by_nobj = defaultdict(list)
     for c in cells:
-        by_nobj[c[3]].append(c)
+        by_nobj[c['n_obj']].append(c)
 
     rows = []
     meta = {'setting': SETTING,
             'kind': 'reevaluation_moea',
-            'problem': 'constrained_lake',
             'n_eval_scenarios': len(eval_scenarios),
-            'aggregation': 'arithmetic_mean_over_scenarios',
-            'multi_rule': 'pool_per_scenario_archives_then_nd_filter',
-            'feasibility_filter': ('drop policies with any violation in any '
-                                   'eval scenario (info["feasible"] == False), '
-                                   'short-circuit on first violating scenario'),
-            'hv_box_source': ('params_config.lake_box_robust_* — same constants '
-                              'as the unconstrained two-lake problem (valid '
-                              'because feasible policies have zero penalty)'),
+            'aggregation': ('strict: mean over all scenarios; '
+                            'tolerant: mean over feasible scenarios only'),
+            'feasibility_threshold': FEASIBILITY_THRESHOLD,
+            'feasibility_modes': {
+                'strict': ("policy kept iff feasibility rate == 1.0; "
+                           "mean over ALL scenarios"),
+                'tolerant': (f"policy kept iff feasibility rate >= "
+                             f"{FEASIBILITY_THRESHOLD}; mean over feasible "
+                             f"scenarios only (avoids double-punishment via "
+                             f"the env's violation penalty)"),
+            },
+            'scenm_rule': ('multi: pool all per-scenario archives; '
+                           'moro: use the first archive only'),
             'n_workers_used': n_workers,
             'generated': time.strftime('%Y-%m-%d %H:%M:%S'),
             'panels': {}}
 
     for n_obj, panel_cells in sorted(by_nobj.items()):
-        hv, box_volume, pmeta = _panel_machinery(panel_cells, n_obj)
-        panel_n_eval = int(sum(c[6] for c in panel_cells))
-        panel_n_infeas = int(sum(c[7] for c in panel_cells))
-        pmeta['n_evaluated_total'] = panel_n_eval
-        pmeta['n_infeasible_total'] = panel_n_infeas
+        hv, box_volume, nadir, ideal, pmeta = _panel_setup(n_obj)
+        bk_s, nu_s = _best_known(panel_cells, hv, 'strict')
+        bk_t, nu_t = _best_known(panel_cells, hv, 'tolerant')
+        pmeta['best_known_hv_strict']   = bk_s
+        pmeta['best_known_hv_tolerant'] = bk_t
+        pmeta['n_union_strict']         = nu_s
+        pmeta['n_union_tolerant']       = nu_t
+        panel_n_eval = int(sum(c['n_evaluated'] for c in panel_cells))
+        panel_n_inf_s = int(sum(c['n_infeasible_strict']
+                                for c in panel_cells if c['n_infeasible_strict'] >= 0))
+        panel_n_inf_t = int(sum(c['n_infeasible_tolerant']
+                                for c in panel_cells if c['n_infeasible_tolerant'] >= 0))
+        pmeta['n_evaluated_total']           = panel_n_eval
+        pmeta['n_infeasible_strict_total']   = panel_n_inf_s
+        pmeta['n_infeasible_tolerant_total'] = panel_n_inf_t
         meta['panels'][str(n_obj)] = pmeta
+
         print(f'\n n_obj={n_obj}: {len(panel_cells)} re-evaluated cells, '
-              f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}, "
-              f"best-known HV={pmeta['best_known_hv']:.5g} "
-              f"(={pmeta['best_known_hv'] / box_volume:.4f} of box)")
+              f"{pmeta['estimator']} HV, box_vol={box_volume:.5g}")
+        print(f"   best-known HV: strict={bk_s:.5g} ({nu_s} pts), "
+              f"tolerant={bk_t:.5g} ({nu_t} pts)")
         if panel_n_eval:
-            print(f'   infeasible: {panel_n_infeas}/{panel_n_eval} '
-                  f'({panel_n_infeas / panel_n_eval:.1%}) across cells')
-        for algo, policy, scenm, no, k, F, n_eval, n_infeas in panel_cells:
-            h = hv(F) if len(F) else 0.0
-            cond = f'{policy}_{scenm}'
+            print(f'   infeasible across cells: '
+                  f'strict {panel_n_inf_s}/{panel_n_eval} '
+                  f'({panel_n_inf_s / panel_n_eval:.1%}); '
+                  f'tolerant {panel_n_inf_t}/{panel_n_eval} '
+                  f'({panel_n_inf_t / panel_n_eval:.1%})')
+
+        for c in panel_cells:
+            F_s = c['F_strict']
+            F_t = c['F_tolerant']
+            h_s = hv(F_s) if len(F_s) else 0.0
+            h_t = hv(F_t) if len(F_t) else 0.0
+            s_s = _spacing_norm(F_s, nadir, ideal)
+            s_t = _spacing_norm(F_t, nadir, ideal)
+            cond = f"{c['policy']}_{c['scenm']}"
             rows.append(dict(
-                paradigm='MOEA', method=algo, condition=cond,
-                policy=policy, scenario_method=scenm,
-                n_obj=no, seed=k, n_solutions=int(len(F)),
-                n_evaluated=int(n_eval), n_infeasible=int(n_infeas),
-                hv=h, box_volume=box_volume,
-                hv_ratio=(h / box_volume if box_volume > 0 else np.nan)))
-        agg = defaultdict(list)
+                paradigm='MOEA', method=c['algo'], condition=cond,
+                policy=c['policy'], scenario_method=c['scenm'],
+                n_obj=c['n_obj'], seed=c['seed'],
+                n_archives=int(c['n_archives']) if c['n_archives'] >= 0 else np.nan,
+                n_evaluated=int(c['n_evaluated']),
+                # Strict mode columns
+                n_total_pol_strict=(int(c['n_total_pol_strict'])
+                                    if c['n_total_pol_strict'] >= 0 else np.nan),
+                n_infeasible_strict=(int(c['n_infeasible_strict'])
+                                     if c['n_infeasible_strict'] >= 0 else np.nan),
+                n_dom_strict=(int(c['n_dom_strict'])
+                              if c['n_dom_strict'] >= 0 else np.nan),
+                n_solutions_strict=int(len(F_s)),
+                hv_strict=h_s,
+                hv_ratio_strict=(h_s / box_volume if box_volume > 0 else np.nan),
+                spacing_norm_strict=s_s,
+                # Tolerant mode columns
+                n_total_pol_tolerant=(int(c['n_total_pol_tolerant'])
+                                      if c['n_total_pol_tolerant'] >= 0 else np.nan),
+                n_infeasible_tolerant=(int(c['n_infeasible_tolerant'])
+                                       if c['n_infeasible_tolerant'] >= 0 else np.nan),
+                n_dom_tolerant=(int(c['n_dom_tolerant'])
+                                if c['n_dom_tolerant'] >= 0 else np.nan),
+                n_solutions_tolerant=int(len(F_t)),
+                hv_tolerant=h_t,
+                hv_ratio_tolerant=(h_t / box_volume if box_volume > 0 else np.nan),
+                spacing_norm_tolerant=s_t,
+                box_volume=box_volume,
+            ))
+
+        agg_s = defaultdict(list)
+        agg_t = defaultdict(list)
         for r in rows:
             if r['n_obj'] == n_obj:
-                agg[(r['method'], r['condition'])].append(r['hv_ratio'])
-        for (m, c), vs in sorted(agg.items()):
-            print(f'   {m:8s} {c:32s} n={len(vs):3d} '
-                  f'HVr={np.mean(vs):.4f}±{np.std(vs):.4f}')
+                k = (r['method'], r['condition'])
+                agg_s[k].append(r['hv_ratio_strict'])
+                agg_t[k].append(r['hv_ratio_tolerant'])
+        for k in sorted(agg_s):
+            vs, vt = agg_s[k], agg_t[k]
+            print(f'   {k[0]:8s} {k[1]:32s} n={len(vs):3d} '
+                  f'HVr_strict={np.mean(vs):.4f}±{np.std(vs):.4f}  '
+                  f'HVr_tolerant={np.mean(vt):.4f}±{np.std(vt):.4f}')
 
     df = pd.DataFrame(rows).sort_values(
         ['n_obj', 'paradigm', 'method', 'condition', 'seed'])
