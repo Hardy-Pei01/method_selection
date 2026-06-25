@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings('ignore', message=r'pkg_resources is deprecated')
+
 import os
 import re
 import glob
@@ -945,8 +948,8 @@ if __name__ == '__main__':
     ENV = 'tree'                # 'tree' | 'lake' | 'constrained_lake'
     SETTING = 'deterministic'   # 'deterministic' | 'robust'
 
-    INPUT_ROOT = '../data/tree_data_1/'
-    OUTPUT_ROOT = '../data/tree_data_1'
+    INPUT_ROOT = f'../data/{ENV}/'
+    OUTPUT_ROOT = f'../data/{ENV}'
 
     EVAL_SCENARIOS_PATH_TREE = '../trees/slip_patterns_depth9_eval.npy'
     EVAL_SCENARIOS_PATH_LAKE = '../lakes/lake_scenarios_eval.npy'

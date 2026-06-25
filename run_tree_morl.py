@@ -12,7 +12,7 @@ from morl.morl_method_config import (
 )
 
 # ── Top-level output folder ───────────────────────────────────────────────────
-root_folder = f'./tree_rl_{tree_depth}'
+root_folder = f'./tree_rl_3'
 
 # ── Experiment toggles ────────────────────────────────────────────────────────
 # Set a value to 1 to include that dimension in the run grid.

@@ -803,11 +803,11 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # CONFIGURATION — edit these.
     # ------------------------------------------------------------------
-    ENV = 'tree'                  # 'tree' | 'lake' | 'constrained_lake'
-    SETTING = 'deterministic'     # 'deterministic' | 'robust'
+    ENV = 'constrained_lake'                  # 'tree' | 'lake' | 'constrained_lake'
+    SETTING = 'robust'     # 'deterministic' | 'robust'
 
-    INPUT_ROOT = '../data/tree_data_2/'
-    OUTPUT_ROOT = '../data/tree_data_2'
+    INPUT_ROOT = f'../data/{ENV}/'
+    OUTPUT_ROOT = f'../data/{ENV}'
 
     # Robust-only paths
     EVAL_SCENARIOS_PATH_TREE = '../trees/slip_patterns_depth9_eval.npy'
@@ -825,7 +825,7 @@ if __name__ == '__main__':
     FEASIBILITY_THRESHOLD = 0.80
 
     # Parallelism: 0 = auto, 1 = serial (debug), N>0 = N workers
-    N_WORKERS = 0
+    N_WORKERS = 40
 
     # ------------------------------------------------------------------
     # Setup

@@ -51,12 +51,41 @@ def _additive_epsilon(A: np.ndarray, B: np.ndarray) -> float:
     return float(diff.max(axis=2).min(axis=1).max())
 
 
+def _additive_epsilon_mean(A: np.ndarray, B: np.ndarray) -> float:
+    """Mean-aggregated companion to _additive_epsilon.
+
+    Identical per-point computation — for each b in B, min_a max_o (b_o - a_o)
+    — but the final reduction over front points is a mean rather than a max.
+    This yields a bulk-sensitive, lower-variance signal that a few wandering
+    tail points cannot dominate. Same empty/inf conventions as the max form.
+    """
+    if B.shape[0] == 0:
+        return 0.0
+    if A.shape[0] == 0:
+        return np.inf
+    diff = B[:, None, :] - A[None, :, :]      # b_i - a_i
+    return float(diff.max(axis=2).min(axis=1).mean())
+
+
 def pcs_shift(prev: set, curr: set, d: int) -> float:
     """Symmetric additive epsilon-indicator between two Pareto sets.
     """
     A = np.array(list(prev), float) if prev else np.empty((0, d))
     B = np.array(list(curr), float) if curr else np.empty((0, d))
     return max(_additive_epsilon(A, B), _additive_epsilon(B, A))
+
+
+def pcs_shift_mean(prev: set, curr: set, d: int) -> float:
+    """Symmetric mean-aggregated additive epsilon-indicator.
+
+    Bulk-sensitive companion to pcs_shift: same per-point epsilon, averaged
+    over front points rather than worst-cased. Reported alongside pcs_shift so
+    convergence can be read both ways — max stays high if any tail point
+    wanders; mean settles toward zero once the bulk of the front stabilises.
+    """
+    A = np.array(list(prev), float) if prev else np.empty((0, d))
+    B = np.array(list(curr), float) if curr else np.empty((0, d))
+    return max(_additive_epsilon_mean(A, B), _additive_epsilon_mean(B, A))
 
 
 def generate_weights(num_objectives: int, num_divisions: int) -> np.ndarray:
@@ -448,22 +477,28 @@ class PQL(MOAgent):
                 if self.global_step >= next_log_step:
                     pcs = self.get_local_pcs(state=self._start_state, decomp=is_decomp)
 
-                    shift = (None if prev_pcs is None
-                             else pcs_shift(prev_pcs, pcs, self.num_objectives))
+                    if prev_pcs is None:
+                        shift = None
+                        shift_mean = None
+                    else:
+                        shift = pcs_shift(prev_pcs, pcs, self.num_objectives)
+                        shift_mean = pcs_shift_mean(prev_pcs, pcs, self.num_objectives)
                     prev_pcs = set(pcs)
 
                     convergence_log.append({
                         "timestep": self.global_step,
                         "pcs_size": len(pcs),
                         "pcs_shift_eps": shift,
+                        "pcs_shift_eps_mean": shift_mean,
                         "epsilon": self.epsilon,
                     })
                     if self.verbose:
                         prefix = f'[{self.tag}] ' if self.tag else '  '
                         s = '—' if shift is None else f'{shift:.4g}'
+                        sm = '—' if shift_mean is None else f'{shift_mean:.4g}'
                         print(
                             f'{prefix}step {self.global_step}/{total_timesteps} '
-                            f'|archive|={len(pcs)} Δpcs={s} '
+                            f'|archive|={len(pcs)} Δpcs(max)={s} Δpcs(mean)={sm} '
                             f'eps={self.epsilon:.3f}',
                             flush=True,
                         )
