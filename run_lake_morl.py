@@ -12,14 +12,14 @@ from morl.morl_method_config import (
 )
 
 # ── Top-level output folder ───────────────────────────────────────────────────
-root_folder = './lake_rl_2'
+root_folder = './lake_rl_3'
 
 # ── Experiment toggles ────────────────────────────────────────────────────────
 
 run_scoring = {
     'pareto': 1,
-    'indicator': 1,
-    'decomposition': 1,
+    'indicator': 0,
+    'decomposition': 0,
 }
 
 run_scenario_method = {
@@ -29,8 +29,8 @@ run_scenario_method = {
 }
 
 obj_uncertain = {
-    'multi_obj': 1,
-    'many_obj': 0
+    'multi_obj': 0,
+    'many_obj': 1
 }
 
 param_uncertain = {

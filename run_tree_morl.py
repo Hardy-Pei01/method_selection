@@ -19,8 +19,8 @@ root_folder = f'./tree_rl_3'
 
 # PQL action-evaluation method (analog of run_evo_method in run_tree_moea.py)
 run_scoring = {
-    'pareto': 1,
-    'indicator': 1,
+    'pareto': 0,
+    'indicator': 0,
     'decomposition': 1,
 }
 
@@ -50,8 +50,8 @@ timestep_settings['single']['multi_obj']['deterministic'] = 100000
 timestep_settings['single']['many_obj']['deterministic'] = 100000
 timestep_settings['multi']['multi_obj']['robust'] = 100000
 timestep_settings['multi']['many_obj']['robust'] = 100000
-timestep_settings['moro']['multi_obj']['robust'] = 100000
-timestep_settings['moro']['many_obj']['robust'] = 100000
+timestep_settings['moro']['multi_obj']['robust'] = 500000
+timestep_settings['moro']['many_obj']['robust'] = 500000
 
 # ── PQL hyperparameters ───────────────────────────────────────────────────────
 # Objective-count-dependent settings (no moea equivalent — PQL-specific).

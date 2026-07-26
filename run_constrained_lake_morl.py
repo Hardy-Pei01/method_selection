@@ -12,14 +12,14 @@ from morl.morl_method_config import (
 )
 
 # ── Top-level output folder ───────────────────────────────────────────────────
-root_folder = './constrained_lake_rl_2'
+root_folder = './constrained_lake_rl_3'
 
 # ── Experiment toggles ────────────────────────────────────────────────────────
 
 run_scoring = {
-    'pareto': 0,
+    'pareto': 1,
     'indicator': 0,
-    'decomposition': 1,
+    'decomposition': 0,
 }
 
 run_scenario_method = {

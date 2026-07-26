@@ -9,15 +9,15 @@ from collections import defaultdict
 import time
 
 activate_logging = 1
-root_folder = f'./tree_ea_3'
+root_folder = f'./tree_ea_5'
 
 run_policy = {
     'intertemporal': 1,
     'table': 1
 }
 run_evo_method = {
-    'NSGAII': 0,
-    'IBEA': 0,
+    'NSGAII': 1,
+    'IBEA': 1,
     'MOEAD': 1
 }
 run_scenario_method = {

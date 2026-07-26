@@ -14,7 +14,7 @@ from collections import defaultdict
 import time
 
 activate_logging = 1
-root_folder = f'./constrained_lake_ea_1'
+root_folder = f'./constrained_lake_ea_3'
 
 run_policy = {
     'intertemporal': 1,
