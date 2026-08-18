@@ -264,7 +264,7 @@ def _plot_bar_panel(ax, df, n_obj, *, metric_col, ylabel, title,
     ax.set_xticks(np.arange(len(methods)))
     if show_xticklabels:
         ax.set_xticklabels([METHOD_LABEL[m] for m in methods],
-                           rotation=20, ha='right')figure_metrics_separate
+                           rotation=20, ha='right')
     else:
         ax.set_xticklabels([])
     ax.grid(axis='y', linestyle=':', linewidth=0.7, alpha=0.7)
@@ -915,5 +915,5 @@ def _save(fig, out_path):
     if not out_path:
         return
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig.savefig(out_path, dpi=400, bbox_inches='tight')
     print(f'Saved {out_path}')
