@@ -508,7 +508,11 @@ def aggregate_curves(records, condition, algo, n_obj, n_grid=200):
                 df['epsilon_progress'].values,
                 np.zeros(len(df)))
     max_nfe = max(r['df']['nfe'].max() for r in matching)
-    grid = np.linspace(0, max_nfe, n_grid)
+    # Start at the first x every seed has a value for, so np.interp does not
+    # extrapolate a flat segment back to 0 (e.g. the PCS shift is undefined
+    # before the second checkpoint).
+    min_nfe = max(r['df']['nfe'].min() for r in matching)
+    grid = np.linspace(min_nfe, max_nfe, n_grid)
     arr = np.array([np.interp(grid, r['df']['nfe'].values,
                               r['df']['epsilon_progress'].values)
                     for r in matching])
