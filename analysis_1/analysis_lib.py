@@ -308,7 +308,7 @@ def legend_handles(df, *, condition_style, condition_label, condition_order):
 # ======================================================================
 def figure_metrics(df, *, metrics, n_objs, condition_style, condition_label,
                    condition_order, modes=None, methods=None, suptitle='',
-                   out_path=None):
+                   out_path=None, mode_in_label=True):
     """Standard fig1.
 
     Layout: (len(metrics) × len(modes)) rows, len(n_objs) columns.
@@ -318,6 +318,10 @@ def figure_metrics(df, *, metrics, n_objs, condition_style, condition_label,
 
     `methods` restricts which methods (and hence paradigms) are drawn —
     e.g. methods=MOEA_METHODS for an MOEA-only figure. Default: all of ORDER.
+
+    `mode_in_label=False` omits the feasibility mode from the y-axis label,
+    e.g. for deterministic constrained runs, which have a single scenario,
+    so the strict/tolerant distinction does not apply.
     """
     if methods is not None:
         df = df[df.method.isin(methods)]
@@ -325,7 +329,8 @@ def figure_metrics(df, *, metrics, n_objs, condition_style, condition_label,
         plan = [(m['col'], m['ylabel'], m['better']) for m in metrics]
     else:
         plan = [(f"{m['base']}_{mode}",
-                 f"{m['ylabel']} — {mode}", m['better'])
+                 f"{m['ylabel']} — {mode}" if mode_in_label else m['ylabel'],
+                 m['better'])
                 for m in metrics for mode in modes]
     n_rows = len(plan)
 
